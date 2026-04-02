@@ -28,7 +28,9 @@ class TestFabricSettings:
         return defaults
 
     def test_valid_config(self) -> None:
-        settings = FabricSettings(**self._valid_params())
+        clean_env = {k: v for k, v in os.environ.items() if not k.startswith("FABRIC_")}
+        with patch.dict(os.environ, clean_env, clear=True), patch("src.config._CONFIG_FILE", Path("/nonexistent")):
+            settings = FabricSettings(**self._valid_params())
         assert settings.server == "test.datawarehouse.fabric.microsoft.com"
         assert settings.database == "gold_warehouse"
         assert settings.max_rows == 500
