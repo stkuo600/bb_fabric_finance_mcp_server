@@ -50,6 +50,7 @@ class FabricSettings(BaseSettings):
     client_id: str
     client_secret: str
     tenant_id: str
+    api_key: str
     write_allowlist: list[str] = []
     max_rows: int = 500
     port: int = 8000

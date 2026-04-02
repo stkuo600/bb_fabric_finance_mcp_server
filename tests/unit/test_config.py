@@ -22,6 +22,7 @@ class TestFabricSettings:
             "client_id": "test-client-id",
             "client_secret": "test-client-secret",
             "tenant_id": "test-tenant-id",
+            "api_key": "test-api-key",
         }
         defaults.update(overrides)
         return defaults
@@ -62,6 +63,15 @@ class TestFabricSettings:
         settings = FabricSettings(**self._valid_params(write_allowlist=""))
         assert settings.write_allowlist == []
 
+    def test_api_key_required(self) -> None:
+        """api_key is required and has no default."""
+        with pytest.raises(Exception):
+            FabricSettings(**self._valid_params(api_key=None))  # no api_key → should fail
+
+    def test_api_key_accepted(self) -> None:
+        settings = FabricSettings(**self._valid_params(api_key="test-key-123"))
+        assert settings.api_key == "test-key-123"
+
 
 class TestLoadConfig:
     """Test load_config with env vars and config file."""
@@ -73,6 +83,7 @@ class TestLoadConfig:
             "FABRIC_CLIENT_ID": "cid",
             "FABRIC_CLIENT_SECRET": "csecret",
             "FABRIC_TENANT_ID": "tid",
+            "FABRIC_API_KEY": "test-key",
         }
         with patch.dict(os.environ, env, clear=False), patch("src.config._CONFIG_FILE", Path("/nonexistent")):
             config = load_config()
@@ -90,6 +101,7 @@ class TestLoadConfig:
                         "client_id": "file-cid",
                         "client_secret": "file-secret",
                         "tenant_id": "file-tid",
+                        "api_key": "test-key",
                     }
                 }
             )
@@ -112,6 +124,7 @@ class TestLoadConfig:
                         "client_id": "file-cid",
                         "client_secret": "file-secret",
                         "tenant_id": "file-tid",
+                        "api_key": "test-key",
                     }
                 }
             )
