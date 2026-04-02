@@ -1,0 +1,12 @@
+{
+    "fabric": {
+        "server": "your-fabric-server.datawarehouse.fabric.microsoft.com",
+        "database": "gold_warehouse",
+        "client_id": "your-client-id",
+        "client_secret": "your-client-secret",
+        "tenant_id": "your-tenant-id",
+        "write_allowlist": ["gold.your_table"],
+        "max_rows": 500,
+        "port": 8000
+    }
+}
