@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+from pydantic import AnyHttpUrl
 from mcp.server.fastmcp import FastMCP
+from mcp.server.auth.settings import AuthSettings
 
 from src.auth import FabricAuth
 from src.config import load_config
 from src.database import FabricDatabase
 from src.logging_setup import setup_logging
+from src.token_verifier import ApiKeyTokenVerifier
 
 setup_logging()
 
@@ -25,10 +28,19 @@ db = FabricDatabase(
     auth=auth,
 )
 
+token_verifier = ApiKeyTokenVerifier(api_key=config.api_key)
+
 mcp_server = FastMCP(
     "Fabric SQL MCP Server",
     stateless_http=True,
     json_response=True,
+    host="0.0.0.0",
+    port=config.port,
+    token_verifier=token_verifier,
+    auth=AuthSettings(
+        issuer_url=AnyHttpUrl("http://localhost"),
+        resource_server_url=AnyHttpUrl(f"http://localhost:{config.port}"),
+    ),
 )
 
 # Import tools to register them with the server
@@ -42,4 +54,4 @@ register_write_tools(mcp_server, db, config)
 
 
 if __name__ == "__main__":
-    mcp_server.run(transport="streamable-http", host="0.0.0.0", port=config.port)
+    mcp_server.run(transport="streamable-http")
