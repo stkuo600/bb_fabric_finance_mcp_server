@@ -17,6 +17,7 @@ def _make_config(**overrides: object) -> FabricSettings:
         "client_secret": "cs",
         "tenant_id": "tid",
         "max_rows": 500,
+        "api_key": "test-api-key",
     }
     defaults.update(overrides)
     return FabricSettings(**defaults)

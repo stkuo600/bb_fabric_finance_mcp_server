@@ -25,6 +25,7 @@ def _get_registered_tools() -> dict[str, object]:
         client_secret="cs",
         tenant_id="tid",
         write_allowlist=["gold.test"],
+        api_key="test-api-key",
     )
 
     register_query_tools(mcp, mock_db, config)
