@@ -27,5 +27,6 @@ Thumbs.db
 config.json
 .env
 .env.*
+.mcp.json
 
 # Lock files (regenerate via pip install)

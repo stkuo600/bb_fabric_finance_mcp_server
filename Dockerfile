@@ -16,9 +16,11 @@ RUN apt-get update && \
 WORKDIR /app
 
 COPY pyproject.toml .
+COPY src/ src/
 RUN pip install --no-cache-dir .
 
-COPY src/ src/
+RUN useradd --create-home appuser
+USER appuser
 
 EXPOSE 8000
 

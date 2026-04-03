@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
-from pydantic import AnyHttpUrl
-from mcp.server.fastmcp import FastMCP
 from mcp.server.auth.settings import AuthSettings
+from mcp.server.fastmcp import FastMCP
+from pydantic import AnyHttpUrl
+from starlette.requests import Request
+from starlette.responses import JSONResponse, Response
 
 from src.auth import FabricAuth
 from src.config import load_config
@@ -42,6 +44,12 @@ mcp_server = FastMCP(
         resource_server_url=AnyHttpUrl(f"http://localhost:{config.port}"),
     ),
 )
+
+@mcp_server.custom_route("/health", methods=["GET"])
+async def health_check(request: Request) -> Response:
+    """Health check endpoint for Azure Container Apps probes."""
+    return JSONResponse({"status": "ok"})
+
 
 # Import tools to register them with the server
 from src.tools.query import register_query_tools  # noqa: E402
