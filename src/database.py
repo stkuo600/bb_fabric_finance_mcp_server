@@ -61,9 +61,9 @@ class FabricDatabase:
         try:
             conn = self._get_connection()
             try:
+                conn.timeout = timeout
                 cursor = conn.cursor()
                 cursor.execute(sql)
-                cursor.timeout = timeout
 
                 columns = [
                     ColumnInfo(
