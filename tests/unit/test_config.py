@@ -65,6 +65,22 @@ class TestFabricSettings:
         settings = FabricSettings(**self._valid_params(write_allowlist=""))
         assert settings.write_allowlist == []
 
+    def test_write_allowlist_from_env_var_csv(self) -> None:
+        env = {
+            "FABRIC_SERVER": "test.datawarehouse.fabric.microsoft.com",
+            "FABRIC_DATABASE": "db",
+            "FABRIC_CLIENT_ID": "cid",
+            "FABRIC_CLIENT_SECRET": "csecret",
+            "FABRIC_TENANT_ID": "tid",
+            "FABRIC_API_KEY": "key",
+            "FABRIC_WRITE_ALLOWLIST": "raw.Dim_Entity,raw.Fact_ExchangeRate, gold.Dim_Entity",
+        }
+        clean_env = {k: v for k, v in os.environ.items() if not k.startswith("FABRIC_")}
+        clean_env.update(env)
+        with patch.dict(os.environ, clean_env, clear=True), patch("src.config._CONFIG_FILE", Path("/nonexistent")):
+            settings = FabricSettings()
+        assert settings.write_allowlist == ["raw.Dim_Entity", "raw.Fact_ExchangeRate", "gold.Dim_Entity"]
+
     def test_api_key_required(self) -> None:
         """api_key is required and has no default."""
         with pytest.raises(Exception):

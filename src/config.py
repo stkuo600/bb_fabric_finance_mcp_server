@@ -5,10 +5,10 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
 
 from pydantic import field_validator
-from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, PydanticBaseSettingsSource, SettingsConfigDict
 
 logger = logging.getLogger("fabric_mcp.config")
 
@@ -51,7 +51,7 @@ class FabricSettings(BaseSettings):
     client_secret: str
     tenant_id: str
     api_key: str
-    write_allowlist: list[str] = []
+    write_allowlist: Annotated[list[str], NoDecode] = []
     max_rows: int = 500
     port: int = 8000
 
