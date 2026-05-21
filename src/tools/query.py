@@ -14,7 +14,37 @@ from src.models import ErrorResponse, QueryResult
 
 logger = logging.getLogger("fabric_mcp.tools.query")
 
-_SELECT_PATTERN = re.compile(r"^\s*SELECT\b", re.IGNORECASE)
+_READ_PREFIX = re.compile(r"^\s*(?:SELECT|WITH)\b", re.IGNORECASE)
+_WRITE_DML = re.compile(r"\b(?:INSERT|UPDATE|DELETE|MERGE)\b", re.IGNORECASE)
+
+
+def _strip_literals_and_comments(sql: str) -> str:
+    """Strip SQL comments and string/identifier literals so a subsequent
+    keyword scan does not match text inside them.
+
+    Handles: `--` line comments, `/* */` block comments, `'...'` strings
+    (with `''` escape), `[...]` and `"..."` quoted identifiers.
+    """
+    sql = re.sub(r"--[^\n]*", "", sql)
+    sql = re.sub(r"/\*.*?\*/", "", sql, flags=re.DOTALL)
+    sql = re.sub(r"'(?:[^']|'')*'", "''", sql)
+    sql = re.sub(r"\[[^\]]*\]", "[]", sql)
+    sql = re.sub(r'"[^"]*"', '""', sql)
+    return sql
+
+
+def _is_read_only_query(sql: str) -> bool:
+    """Accept SELECT or `WITH ... SELECT`. Reject if any outer-statement
+    write DML keyword (INSERT/UPDATE/DELETE/MERGE) appears.
+
+    CTE bodies are grammatically SELECT-only in T-SQL, so a write keyword
+    surviving the literal/comment strip signals a write at the outer
+    statement (e.g. `WITH cte AS (...) INSERT INTO ...`).
+    """
+    if not _READ_PREFIX.match(sql):
+        return False
+    cleaned = _strip_literals_and_comments(sql)
+    return _WRITE_DML.search(cleaned) is None
 
 
 def register_query_tools(mcp: FastMCP, db: FabricDatabase, config: FabricSettings) -> None:
@@ -32,13 +62,16 @@ def register_query_tools(mcp: FastMCP, db: FabricDatabase, config: FabricSetting
         """
         logger.info("Query requested", extra={"tool": "fabric_execute_query"})
 
-        if not _SELECT_PATTERN.match(sql):
+        if not _is_read_only_query(sql):
             error = ErrorResponse(
                 code="INVALID_OPERATION",
-                message="Only SELECT statements are allowed. Use fabric_preview_write for INSERT/UPDATE.",
+                message=(
+                    "Only read-only queries are allowed: a SELECT, or a CTE-prefixed "
+                    "`WITH ... SELECT`. Use fabric_preview_write for INSERT/UPDATE."
+                ),
             )
             logger.warning(
-                "Non-SELECT rejected",
+                "Non-read-only rejected",
                 extra={"tool": "fabric_execute_query", "error_code": "INVALID_OPERATION"},
             )
             return error.model_dump_json()

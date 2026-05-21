@@ -113,3 +113,121 @@ class TestFabricExecuteQuery:
 
         result = json.loads(fn("SELECT bad syntax"))
         assert result["code"] == "QUERY_ERROR"
+
+
+class TestCommonTableExpression:
+    """CTE-prefixed queries (`WITH ...`) must be allowed when the final
+    operation is SELECT, and rejected when the WITH precedes a write DML."""
+
+    def test_simple_with_cte_then_select_allowed(self) -> None:
+        fn, mock_db = _make_query_tool()
+        mock_db.execute_query.return_value = (
+            [ColumnInfo(name="x", type="int", nullable=False)],
+            [{"x": 1}],
+        )
+
+        result = json.loads(fn("WITH cte AS (SELECT 1 AS x) SELECT * FROM cte"))
+
+        assert result.get("code") != "INVALID_OPERATION", (
+            f"WITH-prefixed SELECT must be allowed; got {result}"
+        )
+        assert result["row_count"] == 1
+        mock_db.execute_query.assert_called_once()
+
+    def test_lowercase_with_allowed(self) -> None:
+        fn, mock_db = _make_query_tool()
+        mock_db.execute_query.return_value = (
+            [ColumnInfo(name="x", type="int", nullable=False)],
+            [],
+        )
+        result = json.loads(fn("with cte as (select 1 as x) select * from cte"))
+        assert result.get("code") != "INVALID_OPERATION"
+
+    def test_multiple_ctes_allowed(self) -> None:
+        fn, mock_db = _make_query_tool()
+        mock_db.execute_query.return_value = (
+            [ColumnInfo(name="x", type="int", nullable=False)],
+            [],
+        )
+        sql = (
+            "WITH a AS (SELECT 1 AS x), b AS (SELECT 2 AS x) "
+            "SELECT * FROM a UNION ALL SELECT * FROM b"
+        )
+        result = json.loads(fn(sql))
+        assert result.get("code") != "INVALID_OPERATION"
+
+    def test_recursive_cte_allowed(self) -> None:
+        fn, mock_db = _make_query_tool()
+        mock_db.execute_query.return_value = (
+            [ColumnInfo(name="n", type="int", nullable=False)],
+            [],
+        )
+        sql = (
+            "WITH cte AS ("
+            "  SELECT 1 AS n UNION ALL SELECT n + 1 FROM cte WHERE n < 5"
+            ") SELECT * FROM cte"
+        )
+        result = json.loads(fn(sql))
+        assert result.get("code") != "INVALID_OPERATION"
+
+    def test_with_then_insert_rejected(self) -> None:
+        fn, _ = _make_query_tool()
+        sql = "WITH cte AS (SELECT 1 AS x) INSERT INTO target SELECT x FROM cte"
+        result = json.loads(fn(sql))
+        assert result["code"] == "INVALID_OPERATION"
+
+    def test_with_then_update_rejected(self) -> None:
+        fn, _ = _make_query_tool()
+        sql = (
+            "WITH cte AS (SELECT id FROM src) "
+            "UPDATE target SET col = 1 FROM cte WHERE target.id = cte.id"
+        )
+        result = json.loads(fn(sql))
+        assert result["code"] == "INVALID_OPERATION"
+
+    def test_with_then_delete_rejected(self) -> None:
+        fn, _ = _make_query_tool()
+        sql = "WITH cte AS (SELECT id FROM src) DELETE FROM target WHERE id IN (SELECT id FROM cte)"
+        result = json.loads(fn(sql))
+        assert result["code"] == "INVALID_OPERATION"
+
+    def test_with_then_merge_rejected(self) -> None:
+        fn, _ = _make_query_tool()
+        sql = (
+            "WITH cte AS (SELECT id, val FROM src) "
+            "MERGE INTO target USING cte ON target.id = cte.id "
+            "WHEN MATCHED THEN UPDATE SET val = cte.val"
+        )
+        result = json.loads(fn(sql))
+        assert result["code"] == "INVALID_OPERATION"
+
+    def test_insert_keyword_in_string_literal_does_not_falsely_block(self) -> None:
+        """A SELECT whose projection happens to contain the literal string
+        'INSERT' (e.g. a label column) must still be allowed."""
+        fn, mock_db = _make_query_tool()
+        mock_db.execute_query.return_value = (
+            [ColumnInfo(name="op", type="str", nullable=False)],
+            [{"op": "INSERT"}],
+        )
+        result = json.loads(fn("SELECT 'INSERT' AS op FROM dual"))
+        assert result.get("code") != "INVALID_OPERATION", (
+            f"write keyword in a string literal must not trigger the safety check; got {result}"
+        )
+
+    def test_insert_keyword_in_line_comment_does_not_falsely_block(self) -> None:
+        fn, mock_db = _make_query_tool()
+        mock_db.execute_query.return_value = (
+            [ColumnInfo(name="id", type="int", nullable=False)],
+            [],
+        )
+        result = json.loads(fn("SELECT id FROM t -- INSERT historical note\n"))
+        assert result.get("code") != "INVALID_OPERATION"
+
+    def test_insert_keyword_in_block_comment_does_not_falsely_block(self) -> None:
+        fn, mock_db = _make_query_tool()
+        mock_db.execute_query.return_value = (
+            [ColumnInfo(name="id", type="int", nullable=False)],
+            [],
+        )
+        result = json.loads(fn("SELECT id /* historic: INSERT path removed */ FROM t"))
+        assert result.get("code") != "INVALID_OPERATION"

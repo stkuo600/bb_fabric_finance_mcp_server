@@ -10,7 +10,7 @@ Execute a read-only SQL query against the Fabric data warehouse.
 
 | Name | Type | Required | Description |
 |------|------|----------|-------------|
-| sql | string | yes | SQL SELECT statement to execute |
+| sql | string | yes | Read-only SQL: a `SELECT`, or a CTE-prefixed `WITH ... SELECT` |
 
 **Returns** (success):
 ```json
@@ -38,7 +38,7 @@ Execute a read-only SQL query against the Fabric data warehouse.
 ```
 
 **Behavior**:
-- Only SELECT statements are accepted. Non-SELECT statements return error code `INVALID_OPERATION`.
+- Only read-only queries are accepted: a `SELECT`, or a CTE-prefixed `WITH ... SELECT`. CTE-prefixed write DML (`WITH ... INSERT/UPDATE/DELETE/MERGE`) and any other write statements return error code `INVALID_OPERATION`. Writes must go through `fabric_preview_write` / `fabric_execute_write`.
 - Results limited to `max_rows` (default 500). If truncated, `truncated: true` is set.
 - Query timeout: 30 seconds.
 
