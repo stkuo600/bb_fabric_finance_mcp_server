@@ -59,7 +59,7 @@ Represents the preview returned before write confirmation.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| confirmation_token | string | UUID token for confirming execution |
+| confirmation_token | string | HMAC-signed self-contained token (`<payload_b64url>.<sig_b64url>`) for confirming execution. Stateless — verifiable on any replica sharing the same `client_secret`. |
 | operation | string | "INSERT" or "UPDATE" |
 | table | string | Target table name |
 | sql_summary | string | Human-readable summary of the operation |
@@ -90,5 +90,5 @@ The server does not own or manage the warehouse schema. It interacts with whatev
 ## State Management
 
 - **Token cache**: In-memory MSAL token cache (single access token, auto-refreshed).
-- **Confirmation tokens**: In-memory dict mapping UUID -> pending write SQL. Tokens expire after 5 minutes.
+- **Confirmation tokens**: Stateless HMAC-SHA256 signed tokens. The token itself carries the SQL, operation, target table, expiry (POSIX seconds), and a random nonce; the signing key is derived from `config.client_secret`. No server-side store. Verifiable on any replica that shares the same `client_secret`. Tokens expire 5 minutes after issue. **Replayable within that window** — see `.claude/bugfix/2026-05-22-write-token-cross-instance/report.md` for the cross-replica vs single-use trade-off.
 - **No persistent state**: The server is stateless between restarts. No local database or file storage.

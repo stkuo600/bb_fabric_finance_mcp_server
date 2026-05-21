@@ -208,5 +208,5 @@ Get column details for a specific table.
 | TABLE_NOT_ALLOWED | Target table not on write allowlist |
 | TABLE_NOT_FOUND | Specified table does not exist |
 | TOKEN_EXPIRED | Write confirmation token has expired |
-| TOKEN_INVALID | Write confirmation token not found or already used |
+| TOKEN_INVALID | Write confirmation token is missing, malformed, or has an invalid signature |
 | CONFIG_ERROR | Server misconfiguration |

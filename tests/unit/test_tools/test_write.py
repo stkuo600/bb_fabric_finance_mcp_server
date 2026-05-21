@@ -7,7 +7,12 @@ from datetime import UTC, datetime, timedelta
 from unittest.mock import MagicMock
 
 from src.config import FabricSettings
-from src.tools.write import _is_table_allowed, _parse_write_sql, _pending_writes
+from src.tools.write import (
+    _TOKEN_VERSION,
+    _is_table_allowed,
+    _make_token,
+    _parse_write_sql,
+)
 
 
 def _make_config(**overrides: object) -> FabricSettings:
@@ -84,9 +89,6 @@ class TestIsTableAllowed:
 class TestFabricPreviewWrite:
     """Test the preview write tool."""
 
-    def setup_method(self) -> None:
-        _pending_writes.clear()
-
     def test_valid_insert_returns_preview(self) -> None:
         tools = _make_write_tools()
         fn, _ = tools["fabric_preview_write"]
@@ -136,9 +138,6 @@ class TestFabricPreviewWrite:
 class TestFabricExecuteWrite:
     """Test the execute write tool."""
 
-    def setup_method(self) -> None:
-        _pending_writes.clear()
-
     def test_valid_token_executes_write(self) -> None:
         tools = _make_write_tools()
         preview_fn, _ = tools["fabric_preview_write"]
@@ -162,7 +161,102 @@ class TestFabricExecuteWrite:
 
         assert result["code"] == "TOKEN_INVALID"
 
-    def test_token_single_use(self) -> None:
+    def test_expired_token_rejected(self) -> None:
+        config = _make_config()
+        tools = _make_write_tools(config=config)
+        execute_fn, _ = tools["fabric_execute_write"]
+
+        # Forge a properly-signed token with an `exp` in the past.
+        expired_at = datetime.now(tz=UTC) - timedelta(minutes=1)
+        payload = {
+            "v": _TOKEN_VERSION,
+            "sql": "INSERT INTO gold.transactions (id) VALUES (1)",
+            "op": "INSERT",
+            "table": "gold.transactions",
+            "exp": expired_at.timestamp(),
+            "nonce": "0" * 32,
+        }
+        token = _make_token(payload, config.client_secret)
+
+        result = json.loads(execute_fn(token))
+        assert result["code"] == "TOKEN_EXPIRED"
+
+
+class TestStatelessToken:
+    """Confirmation tokens must be redeemable across independent server instances
+    (different Container Apps replicas) that share the same configuration.
+
+    Each `_make_write_tools()` call simulates a fresh Python process — the
+    stateless token design must not rely on any in-process state.
+    """
+
+    def test_token_redeemable_on_independent_instance(self) -> None:
+        """Replica A issues a token; replica B (separate registration, same
+        config) must be able to redeem it."""
+        config = _make_config()
+
+        tools_a = _make_write_tools(config=config)
+        preview_a, _ = tools_a["fabric_preview_write"]
+
+        tools_b = _make_write_tools(config=config)
+        execute_b, mock_db_b = tools_b["fabric_execute_write"]
+        mock_db_b.execute_write.return_value = 1
+
+        preview = json.loads(preview_a("INSERT INTO gold.transactions (id) VALUES (1)"))
+        token = preview["confirmation_token"]
+
+        result = json.loads(execute_b(token))
+
+        assert result.get("code") != "TOKEN_INVALID", (
+            f"token must be redeemable on a different instance; got {result}"
+        )
+        assert result["affected_rows"] == 1
+        assert result["operation"] == "INSERT"
+        assert result["table"] == "gold.transactions"
+        mock_db_b.execute_write.assert_called_once_with(
+            "INSERT INTO gold.transactions (id) VALUES (1)"
+        )
+
+    def test_tampered_token_rejected(self) -> None:
+        tools = _make_write_tools()
+        preview_fn, _ = tools["fabric_preview_write"]
+        execute_fn, _ = tools["fabric_execute_write"]
+
+        preview = json.loads(preview_fn("INSERT INTO gold.transactions (id) VALUES (1)"))
+        token = preview["confirmation_token"]
+        # Flip one character in the middle of the token
+        midpoint = len(token) // 2
+        flipped = "A" if token[midpoint] != "A" else "B"
+        tampered = token[:midpoint] + flipped + token[midpoint + 1 :]
+
+        result = json.loads(execute_fn(tampered))
+        assert result["code"] == "TOKEN_INVALID"
+
+    def test_token_signed_with_different_secret_rejected(self) -> None:
+        """A token issued under one client_secret must not be redeemable under
+        a different client_secret (simulates secret rotation between replicas
+        that have not yet picked up the new value)."""
+        config_a = _make_config(client_secret="secret-A")
+        config_b = _make_config(client_secret="secret-B")
+
+        tools_a = _make_write_tools(config=config_a)
+        preview_a, _ = tools_a["fabric_preview_write"]
+
+        tools_b = _make_write_tools(config=config_b)
+        execute_b, _ = tools_b["fabric_execute_write"]
+
+        preview = json.loads(preview_a("INSERT INTO gold.transactions (id) VALUES (1)"))
+        token = preview["confirmation_token"]
+
+        result = json.loads(execute_b(token))
+        assert result["code"] == "TOKEN_INVALID"
+
+    def test_token_replay_within_window_succeeds(self) -> None:
+        """Stateless tokens are replayable within the validity window. This is
+        a deliberate behavioural deviation from the original spec
+        (`tasks.md:130` "one-time use invalidation") in exchange for working
+        correctness across replicas. See report.md for the trade-off
+        analysis."""
         tools = _make_write_tools()
         preview_fn, _ = tools["fabric_preview_write"]
         execute_fn, mock_db = tools["fabric_execute_write"]
@@ -171,24 +265,9 @@ class TestFabricExecuteWrite:
         preview = json.loads(preview_fn("INSERT INTO gold.transactions (id) VALUES (1)"))
         token = preview["confirmation_token"]
 
-        # First use succeeds
         result1 = json.loads(execute_fn(token))
-        assert "affected_rows" in result1
-
-        # Second use fails
         result2 = json.loads(execute_fn(token))
-        assert result2["code"] == "TOKEN_INVALID"
 
-    def test_expired_token_rejected(self) -> None:
-        tools = _make_write_tools()
-        preview_fn, _ = tools["fabric_preview_write"]
-        execute_fn, _ = tools["fabric_execute_write"]
-
-        preview = json.loads(preview_fn("INSERT INTO gold.transactions (id) VALUES (1)"))
-        token = preview["confirmation_token"]
-
-        # Manually expire the token
-        _pending_writes[token]["expires_at"] = datetime.now(tz=UTC) - timedelta(minutes=1)
-
-        result = json.loads(execute_fn(token))
-        assert result["code"] == "TOKEN_EXPIRED"
+        assert "affected_rows" in result1
+        assert "affected_rows" in result2
+        assert mock_db.execute_write.call_count == 2
