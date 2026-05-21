@@ -121,3 +121,111 @@ class TestFabricDatabase:
 
         call_kwargs = mock_connect.call_args
         assert call_kwargs.kwargs["autocommit"] is True
+
+
+class TestConnectionReuse:
+    """Connection reuse across calls to amortise the pyodbc-connect handshake."""
+
+    def _make_db(self) -> tuple[FabricDatabase, MagicMock]:
+        mock_auth = MagicMock()
+        mock_auth.get_token.return_value = "test-access-token"
+        db = FabricDatabase(
+            server="test.datawarehouse.fabric.microsoft.com",
+            database="gold_warehouse",
+            auth=mock_auth,
+        )
+        return db, mock_auth
+
+    def _stub_cursor(self, mock_connect: MagicMock) -> MagicMock:
+        cursor = MagicMock()
+        cursor.description = [("id", int, None, None, None, None, False)]
+        cursor.fetchall.return_value = []
+        cursor.rowcount = 0
+        mock_connect.return_value.cursor.return_value = cursor
+        return cursor
+
+    @patch("src.database.pyodbc.connect")
+    def test_execute_query_reuses_connection_across_calls(self, mock_connect: MagicMock) -> None:
+        db, _ = self._make_db()
+        self._stub_cursor(mock_connect)
+
+        for _ in range(5):
+            db.execute_query("SELECT 1")
+
+        assert mock_connect.call_count == 1, (
+            f"expected one pyodbc.connect across 5 queries, got {mock_connect.call_count}"
+        )
+
+    @patch("src.database.pyodbc.connect")
+    def test_execute_write_reuses_connection_across_calls(self, mock_connect: MagicMock) -> None:
+        db, _ = self._make_db()
+        self._stub_cursor(mock_connect)
+
+        for _ in range(5):
+            db.execute_write("UPDATE t SET c=1")
+
+        assert mock_connect.call_count == 1
+
+    @patch("src.database.pyodbc.connect")
+    def test_mixed_query_and_write_reuse_connection(self, mock_connect: MagicMock) -> None:
+        db, _ = self._make_db()
+        self._stub_cursor(mock_connect)
+
+        db.execute_query("SELECT 1")
+        db.execute_write("UPDATE t SET c=1")
+        db.execute_query("SELECT 2")
+        db.execute_write("UPDATE t SET c=2")
+
+        assert mock_connect.call_count == 1
+
+    @patch("src.database.pyodbc.connect")
+    def test_reconnects_on_connection_class_sqlstate(self, mock_connect: MagicMock) -> None:
+        import pyodbc
+
+        db, _ = self._make_db()
+
+        # Two distinct connection objects so we can distinguish "old" vs "new".
+        broken_conn = MagicMock(name="broken_conn")
+        broken_cursor = MagicMock()
+        broken_cursor.execute.side_effect = pyodbc.Error("08S01", "Communication link failure")
+        broken_conn.cursor.return_value = broken_cursor
+
+        good_conn = MagicMock(name="good_conn")
+        good_cursor = MagicMock()
+        good_cursor.description = [("id", int, None, None, None, None, False)]
+        good_cursor.fetchall.return_value = [(1,)]
+        good_conn.cursor.return_value = good_cursor
+
+        mock_connect.side_effect = [broken_conn, good_conn]
+
+        columns, rows = db.execute_query("SELECT 1")
+
+        assert mock_connect.call_count == 2, "expected one reconnect after 08-class SQLSTATE"
+        assert len(rows) == 1
+        assert rows[0] == {"id": 1}
+        broken_conn.close.assert_called()  # broken connection must be discarded
+
+    @patch("src.database.pyodbc.connect")
+    def test_query_error_does_not_discard_connection(self, mock_connect: MagicMock) -> None:
+        import pyodbc
+
+        db, _ = self._make_db()
+
+        # Single connection that returns different cursors on successive calls.
+        bad_cursor = MagicMock()
+        bad_cursor.execute.side_effect = pyodbc.Error("42S02", "Invalid object name 'no_such_table'")
+
+        good_cursor = MagicMock()
+        good_cursor.description = [("id", int, None, None, None, None, False)]
+        good_cursor.fetchall.return_value = []
+
+        mock_connect.return_value.cursor.side_effect = [bad_cursor, good_cursor]
+
+        with pytest.raises(RuntimeError, match="QUERY_ERROR"):
+            db.execute_query("SELECT * FROM no_such_table")
+
+        db.execute_query("SELECT 1")
+
+        assert mock_connect.call_count == 1, (
+            "query-side error (non-08 SQLSTATE) must not trigger a reconnect"
+        )
