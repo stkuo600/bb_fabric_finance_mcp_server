@@ -205,3 +205,94 @@ class TestFabricDescribeTable:
 
         result = json.loads(fn("gold.nonexistent"))
         assert result["code"] == "TABLE_NOT_FOUND"
+
+    def test_returns_object_type_for_base_table(self) -> None:
+        tools = _make_schema_tools()
+        fn, mock_db = tools["fabric_describe_table"]
+        mock_db.execute_query.return_value = (
+            [],
+            [
+                {
+                    "TABLE_SCHEMA": "gold",
+                    "TABLE_TYPE": "BASE TABLE",
+                    "COLUMN_NAME": "id",
+                    "DATA_TYPE": "int",
+                    "IS_NULLABLE": "NO",
+                    "CHARACTER_MAXIMUM_LENGTH": None,
+                    "NUMERIC_PRECISION": None,
+                    "NUMERIC_SCALE": None,
+                },
+            ],
+        )
+
+        result = json.loads(fn("gold.transactions"))
+        assert result["object_type"] == "BASE TABLE"
+
+    def test_returns_object_type_for_view(self) -> None:
+        tools = _make_schema_tools()
+        fn, mock_db = tools["fabric_describe_table"]
+        mock_db.execute_query.return_value = (
+            [],
+            [
+                {
+                    "TABLE_SCHEMA": "gold",
+                    "TABLE_TYPE": "VIEW",
+                    "COLUMN_NAME": "entity_id",
+                    "DATA_TYPE": "int",
+                    "IS_NULLABLE": "NO",
+                    "CHARACTER_MAXIMUM_LENGTH": None,
+                    "NUMERIC_PRECISION": None,
+                    "NUMERIC_SCALE": None,
+                },
+                {
+                    "TABLE_SCHEMA": "gold",
+                    "TABLE_TYPE": "VIEW",
+                    "COLUMN_NAME": "usd_amount",
+                    "DATA_TYPE": "decimal",
+                    "IS_NULLABLE": "YES",
+                    "CHARACTER_MAXIMUM_LENGTH": None,
+                    "NUMERIC_PRECISION": 18,
+                    "NUMERIC_SCALE": 2,
+                },
+            ],
+        )
+
+        result = json.loads(fn("gold.vw_Sch1X_EntityUSD"))
+        assert result["object_type"] == "VIEW"
+        assert len(result["columns"]) == 2
+
+
+class TestFabricListWritableTables:
+    """The fabric_list_writable_tables tool reflects config.write_allowlist."""
+
+    def _make_with_allowlist(self, allowlist: list[str]) -> callable:
+        from mcp.server.fastmcp import FastMCP
+
+        from src.config import FabricSettings
+        from src.tools.write import register_write_tools
+
+        cfg = FabricSettings(
+            server="test.datawarehouse.fabric.microsoft.com",
+            database="db",
+            client_id="cid",
+            client_secret="cs",
+            tenant_id="tid",
+            api_key="test-api-key",
+            write_allowlist=allowlist,
+        )
+        mock_mcp = FastMCP("test")
+        register_write_tools(mock_mcp, MagicMock(), cfg)
+        for tool in mock_mcp._tool_manager._tools.values():
+            if tool.name == "fabric_list_writable_tables":
+                return tool.fn
+        raise RuntimeError("fabric_list_writable_tables not registered")
+
+    def test_returns_configured_allowlist(self) -> None:
+        fn = self._make_with_allowlist(["raw.Fact_ExchangeRate", "gold.Dim_Entity"])
+        result = json.loads(fn())
+        assert set(result["writable_tables"]) == {"raw.Fact_ExchangeRate", "gold.Dim_Entity"}
+
+    def test_empty_allowlist_returns_empty_list(self) -> None:
+        fn = self._make_with_allowlist([])
+        result = json.loads(fn())
+        assert result["writable_tables"] == []

@@ -104,6 +104,21 @@ def register_write_tools(mcp: FastMCP, db: FabricDatabase, config: FabricSetting
     """Register write-related MCP tools."""
 
     @mcp.tool()
+    def fabric_list_writable_tables() -> str:
+        """List tables on the write allowlist.
+
+        Returns the set of tables that can be the target of
+        `fabric_preview_write` / `fabric_execute_write`. Reads the
+        server's configured `write_allowlist` (FABRIC_WRITE_ALLOWLIST
+        env var) — no database round-trip.
+        """
+        logger.info(
+            "Writable tables requested",
+            extra={"tool": "fabric_list_writable_tables", "count": len(config.write_allowlist)},
+        )
+        return json.dumps({"writable_tables": list(config.write_allowlist)})
+
+    @mcp.tool()
     def fabric_preview_write(sql: str) -> str:
         """Preview a write operation and receive a confirmation token. Does NOT execute the SQL.
 

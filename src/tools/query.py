@@ -51,14 +51,18 @@ def register_query_tools(mcp: FastMCP, db: FabricDatabase, config: FabricSetting
     """Register query-related MCP tools."""
 
     @mcp.tool()
-    def fabric_execute_query(sql: str) -> str:
-        """Execute a read-only SQL SELECT query against the Fabric data warehouse.
+    def fabric_execute_query(sql: str, max_rows: int | None = None) -> str:
+        """Execute a read-only SQL query against the Fabric data warehouse.
 
-        Returns query results as a JSON array of objects with column metadata.
-        Only SELECT statements are accepted; other statement types are rejected.
+        Accepts a SELECT, or a CTE-prefixed `WITH ... SELECT`. Other statement
+        types (and CTE-prefixed write DML) are rejected.
 
         Args:
-            sql: SQL SELECT statement to execute.
+            sql: Read-only SQL to execute.
+            max_rows: Optional per-call row cap (1 <= max_rows <= 10000). When
+                omitted, falls back to the server-configured default
+                (FABRIC_MAX_ROWS, default 500). Results above the cap are
+                truncated and the response sets `truncated: true`.
         """
         logger.info("Query requested", extra={"tool": "fabric_execute_query"})
 
@@ -76,15 +80,28 @@ def register_query_tools(mcp: FastMCP, db: FabricDatabase, config: FabricSetting
             )
             return error.model_dump_json()
 
+        if max_rows is not None and not 1 <= max_rows <= 10000:
+            error = ErrorResponse(
+                code="INVALID_OPERATION",
+                message=f"max_rows must be between 1 and 10000; got {max_rows}.",
+            )
+            logger.warning(
+                "Invalid max_rows",
+                extra={"tool": "fabric_execute_query", "error_code": "INVALID_OPERATION"},
+            )
+            return error.model_dump_json()
+
+        effective_cap = max_rows if max_rows is not None else config.max_rows
+
         try:
             columns, rows = db.execute_query(sql, timeout=30)
         except RuntimeError as e:
             logger.error("Query failed", extra={"tool": "fabric_execute_query", "error_code": "QUERY_ERROR"})
             return str(e)
 
-        truncated = len(rows) > config.max_rows
+        truncated = len(rows) > effective_cap
         if truncated:
-            rows = rows[: config.max_rows]
+            rows = rows[:effective_cap]
 
         result = QueryResult(
             columns=columns,

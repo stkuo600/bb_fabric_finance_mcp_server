@@ -11,6 +11,7 @@ Execute a read-only SQL query against the Fabric data warehouse.
 | Name | Type | Required | Description |
 |------|------|----------|-------------|
 | sql | string | yes | Read-only SQL: a `SELECT`, or a CTE-prefixed `WITH ... SELECT` |
+| max_rows | integer | no | Per-call row cap (1–10000). Overrides the server default. |
 
 **Returns** (success):
 ```json
@@ -39,7 +40,7 @@ Execute a read-only SQL query against the Fabric data warehouse.
 
 **Behavior**:
 - Only read-only queries are accepted: a `SELECT`, or a CTE-prefixed `WITH ... SELECT`. CTE-prefixed write DML (`WITH ... INSERT/UPDATE/DELETE/MERGE`) and any other write statements return error code `INVALID_OPERATION`. Writes must go through `fabric_preview_write` / `fabric_execute_write`.
-- Results limited to `max_rows` (default 500). If truncated, `truncated: true` is set.
+- Results limited to `max_rows` (call-site override, else server-config default of 500). If truncated, `truncated: true` is set. Per-call `max_rows` outside `[1, 10000]` returns `INVALID_OPERATION`.
 - Query timeout: 30 seconds.
 
 ---
@@ -117,6 +118,25 @@ Execute a previously previewed write operation using a confirmation token.
 
 ---
 
+## Tool: `fabric_list_writable_tables`
+
+List tables on the write allowlist — i.e. those that may be the target of `fabric_preview_write` / `fabric_execute_write`.
+
+**Parameters**: none.
+
+**Returns** (success):
+```json
+{
+  "writable_tables": ["raw.Fact_ExchangeRate", "gold.Dim_Entity"]
+}
+```
+
+**Behavior**:
+- Pure read of server configuration (`write_allowlist` / `FABRIC_WRITE_ALLOWLIST`). No database round-trip.
+- Returns an empty list when no tables are configured.
+
+---
+
 ## Tool: `fabric_list_schemas`
 
 List all database schemas in the connected data warehouse.
@@ -177,6 +197,7 @@ Get column details for a specific table.
 {
   "schema_name": "gold",
   "table_name": "transactions",
+  "object_type": "BASE TABLE",
   "columns": [
     {"name": "id", "type": "int", "nullable": false},
     {"name": "amount", "type": "decimal(18,2)", "nullable": false},
@@ -185,6 +206,8 @@ Get column details for a specific table.
   ]
 }
 ```
+
+`object_type` is `"BASE TABLE"` for tables and `"VIEW"` for views.
 
 **Returns** (error - table not found):
 ```json

@@ -110,13 +110,16 @@ def register_schema_tools(mcp: FastMCP, db: FabricDatabase) -> None:
             table = table_name
 
         sql = (
-            "SELECT TABLE_SCHEMA, COLUMN_NAME, DATA_TYPE, IS_NULLABLE, "
-            "CHARACTER_MAXIMUM_LENGTH, NUMERIC_PRECISION, NUMERIC_SCALE "
-            f"FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = '{table}'"
+            "SELECT c.TABLE_SCHEMA, t.TABLE_TYPE, c.COLUMN_NAME, c.DATA_TYPE, c.IS_NULLABLE, "
+            "c.CHARACTER_MAXIMUM_LENGTH, c.NUMERIC_PRECISION, c.NUMERIC_SCALE "
+            "FROM INFORMATION_SCHEMA.COLUMNS c "
+            "JOIN INFORMATION_SCHEMA.TABLES t "
+            "  ON c.TABLE_SCHEMA = t.TABLE_SCHEMA AND c.TABLE_NAME = t.TABLE_NAME "
+            f"WHERE c.TABLE_NAME = '{table}'"
         )
         if schema:
-            sql += f" AND TABLE_SCHEMA = '{schema}'"
-        sql += " ORDER BY ORDINAL_POSITION"
+            sql += f" AND c.TABLE_SCHEMA = '{schema}'"
+        sql += " ORDER BY c.ORDINAL_POSITION"
 
         try:
             _, rows = db.execute_query(sql)
@@ -133,6 +136,7 @@ def register_schema_tools(mcp: FastMCP, db: FabricDatabase) -> None:
             return error.model_dump_json()
 
         resolved_schema = rows[0]["TABLE_SCHEMA"]
+        object_type = rows[0].get("TABLE_TYPE", "BASE TABLE")
 
         columns = []
         for row in rows:
@@ -152,6 +156,7 @@ def register_schema_tools(mcp: FastMCP, db: FabricDatabase) -> None:
         result = {
             "schema_name": resolved_schema,
             "table_name": table,
+            "object_type": object_type,
             "columns": columns,
         }
         logger.info(

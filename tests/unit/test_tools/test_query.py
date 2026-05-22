@@ -106,6 +106,44 @@ class TestFabricExecuteQuery:
         assert result["row_count"] == 2
         assert len(result["rows"]) == 2
 
+    def test_per_call_max_rows_override(self) -> None:
+        """Caller can pass max_rows to override the server-config default."""
+        config = _make_config(max_rows=500)
+        fn, mock_db = _make_query_tool(config=config)
+        mock_db.execute_query.return_value = (
+            [ColumnInfo(name="id", type="int", nullable=False)],
+            [{"id": i} for i in range(1, 6)],
+        )
+
+        result = json.loads(fn("SELECT id FROM t", max_rows=3))
+        assert result["truncated"] is True
+        assert result["row_count"] == 3
+        assert len(result["rows"]) == 3
+
+    def test_per_call_max_rows_allows_smaller_than_default(self) -> None:
+        config = _make_config(max_rows=500)
+        fn, mock_db = _make_query_tool(config=config)
+        mock_db.execute_query.return_value = (
+            [ColumnInfo(name="id", type="int", nullable=False)],
+            [{"id": i} for i in range(1, 11)],
+        )
+        result = json.loads(fn("SELECT id FROM t", max_rows=1))
+        assert result["row_count"] == 1
+        assert result["truncated"] is True
+
+    def test_per_call_max_rows_zero_or_negative_rejected(self) -> None:
+        fn, _ = _make_query_tool()
+        result = json.loads(fn("SELECT 1", max_rows=0))
+        assert result["code"] == "INVALID_OPERATION"
+
+        result2 = json.loads(fn("SELECT 1", max_rows=-5))
+        assert result2["code"] == "INVALID_OPERATION"
+
+    def test_per_call_max_rows_above_hard_cap_rejected(self) -> None:
+        fn, _ = _make_query_tool()
+        result = json.loads(fn("SELECT 1", max_rows=10001))
+        assert result["code"] == "INVALID_OPERATION"
+
     def test_query_error_returns_error_response(self) -> None:
         fn, mock_db = _make_query_tool()
         error_json = json.dumps({"code": "QUERY_ERROR", "message": "Syntax error", "details": None})
