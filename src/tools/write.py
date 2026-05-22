@@ -31,6 +31,7 @@ _UPDATE_PATTERN = re.compile(r"^\s*UPDATE\s+(\S+)", re.IGNORECASE)
 
 _TOKEN_VERSION = 1
 _SIGNING_KEY_DOMAIN = b"fabric-mcp-write-confirmation\x00"
+_BATCH_MAX_TOKENS = 100
 
 
 def _parse_write_sql(sql: str) -> tuple[str, str] | None:
@@ -101,6 +102,152 @@ def _verify_token(token: str, secret: str) -> dict[str, object] | None:
 
 def register_write_tools(mcp: FastMCP, db: FabricDatabase, config: FabricSettings) -> None:
     """Register write-related MCP tools."""
+
+    @mcp.tool()
+    def fabric_execute_write_batch(confirmation_tokens: list[str]) -> str:
+        """Redeem multiple confirmation tokens in one round-trip.
+
+        Best-effort semantics: every token is verified and executed
+        independently. A failure on one token does not roll back earlier
+        successes nor stop later tokens from executing. The response
+        carries per-token status plus succeeded/failed counts, so the
+        caller can detect partial failure and act on it.
+
+        Args:
+            confirmation_tokens: List of tokens previously issued by
+                fabric_preview_write. Max 100 per call; a longer list is
+                refused with INVALID_OPERATION before any verification.
+
+        Returns:
+            {
+              "results": [
+                {"status": "ok", "affected_rows": N, "operation": "INSERT", "table": "..."},
+                {"status": "error", "code": "TOKEN_INVALID", "operation": "...", "table": "...", ...},
+                ...
+              ],
+              "total_succeeded": <int>,
+              "total_failed": <int>
+            }
+        """
+        if len(confirmation_tokens) > _BATCH_MAX_TOKENS:
+            error = ErrorResponse(
+                code="INVALID_OPERATION",
+                message=(
+                    f"Batch size {len(confirmation_tokens)} exceeds the limit of "
+                    f"{_BATCH_MAX_TOKENS} tokens."
+                ),
+            )
+            logger.warning(
+                "Batch rejected: too many tokens",
+                extra={
+                    "tool": "fabric_execute_write_batch",
+                    "count": len(confirmation_tokens),
+                    "error_code": "INVALID_OPERATION",
+                },
+            )
+            return error.model_dump_json()
+
+        logger.info(
+            "Write batch requested: %d tokens",
+            len(confirmation_tokens),
+            extra={"tool": "fabric_execute_write_batch", "count": len(confirmation_tokens)},
+        )
+
+        results: list[dict[str, object]] = []
+        succeeded = 0
+        failed = 0
+        now_ts = datetime.now(tz=UTC).timestamp()
+
+        for token in confirmation_tokens:
+            payload = _verify_token(token, config.client_secret)
+            if payload is None:
+                results.append(
+                    {
+                        "status": "error",
+                        "code": "TOKEN_INVALID",
+                        "message": "Confirmation token is missing, malformed, or has an invalid signature.",
+                    }
+                )
+                failed += 1
+                continue
+
+            exp = payload.get("exp")
+            if not isinstance(exp, int | float) or exp < now_ts:
+                results.append(
+                    {
+                        "status": "error",
+                        "code": "TOKEN_EXPIRED",
+                        "message": "Confirmation token has expired. Please preview the write operation again.",
+                        "operation": str(payload.get("op", "")),
+                        "table": str(payload.get("table", "")),
+                    }
+                )
+                failed += 1
+                continue
+
+            sql = str(payload.get("sql", ""))
+            operation = str(payload.get("op", ""))
+            table = str(payload.get("table", ""))
+
+            try:
+                affected = db.execute_write(sql)
+            except RuntimeError as e:
+                # db.execute_write wraps pyodbc errors as ErrorResponse JSON.
+                # Parse it back so the per-token result is structured.
+                try:
+                    err_payload = json.loads(str(e))
+                except json.JSONDecodeError:
+                    err_payload = {"code": "QUERY_ERROR", "message": str(e), "details": None}
+                results.append(
+                    {
+                        "status": "error",
+                        "operation": operation,
+                        "table": table,
+                        **err_payload,
+                    }
+                )
+                failed += 1
+                continue
+
+            results.append(
+                {
+                    "status": "ok",
+                    "affected_rows": affected,
+                    "operation": operation,
+                    "table": table,
+                }
+            )
+            succeeded += 1
+            logger.info(
+                "Batch write executed: %s on %s, %d rows affected",
+                operation,
+                table,
+                affected,
+                extra={
+                    "tool": "fabric_execute_write_batch",
+                    "operation": operation,
+                    "table": table,
+                    "row_count": affected,
+                },
+            )
+
+        logger.info(
+            "Write batch completed: %d succeeded, %d failed",
+            succeeded,
+            failed,
+            extra={
+                "tool": "fabric_execute_write_batch",
+                "total_succeeded": succeeded,
+                "total_failed": failed,
+            },
+        )
+        return json.dumps(
+            {
+                "results": results,
+                "total_succeeded": succeeded,
+                "total_failed": failed,
+            }
+        )
 
     @mcp.tool()
     def fabric_delete_period(table: str, fiscal_year: int, fiscal_month: int) -> str:

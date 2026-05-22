@@ -62,6 +62,7 @@ class TestToolRegistration:
             "fabric_describe_table",
             "fabric_preview_write",
             "fabric_execute_write",
+            "fabric_execute_write_batch",
             "fabric_list_writable_tables",
             "fabric_delete_period",
         }

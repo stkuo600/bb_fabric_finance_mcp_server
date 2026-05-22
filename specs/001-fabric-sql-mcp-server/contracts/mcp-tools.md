@@ -119,6 +119,47 @@ Execute a previously previewed write operation using a confirmation token.
 
 ---
 
+## Tool: `fabric_execute_write_batch`
+
+Redeem multiple confirmation tokens in a single MCP round-trip. Intended for batch INSERT/UPDATE workflows where calling `fabric_execute_write` once per row would mean 2N tool calls for N rows.
+
+**Parameters**:
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| confirmation_tokens | array of string | yes | List of tokens previously issued by `fabric_preview_write`. Max 100 per call. |
+
+**Returns** (success — note that "success" here means the request was well-formed; individual tokens may still have failed):
+```json
+{
+  "results": [
+    {"status": "ok", "affected_rows": 1, "operation": "INSERT", "table": "raw.Fact_X"},
+    {"status": "error", "code": "TOKEN_EXPIRED", "message": "...", "operation": "INSERT", "table": "raw.Fact_X"},
+    {"status": "ok", "affected_rows": 1, "operation": "INSERT", "table": "raw.Fact_X"}
+  ],
+  "total_succeeded": 2,
+  "total_failed": 1
+}
+```
+
+**Returns** (error — batch rejected outright):
+```json
+{
+  "code": "INVALID_OPERATION",
+  "message": "Batch size 142 exceeds the limit of 100 tokens.",
+  "details": null
+}
+```
+
+**Behavior**:
+- **Best-effort**: each token is verified and executed independently. A failure on one token (`TOKEN_INVALID`, `TOKEN_EXPIRED`, or a `QUERY_ERROR` from the database) does not roll back earlier successes nor prevent later tokens from running.
+- Empty list is a successful no-op: `{"results": [], "total_succeeded": 0, "total_failed": 0}`.
+- More than 100 tokens returns `INVALID_OPERATION` without verifying any of them.
+- Each successful execution emits an audit log line (same shape as `fabric_execute_write`), plus a batch summary at completion.
+- **Atomicity is not provided.** If the workflow requires "all rows commit or none", callers should pre-validate (e.g. `fabric_execute_query("SELECT COUNT(*) ...")`) and accept the residual risk, or stick with `fabric_execute_write` and implement compensating actions in the caller.
+
+---
+
 ## Tool: `fabric_list_writable_tables`
 
 List tables on the write allowlist — i.e. those that may be the target of `fabric_preview_write` / `fabric_execute_write` / `fabric_delete_period`.

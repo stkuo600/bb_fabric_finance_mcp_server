@@ -314,6 +314,163 @@ class TestStatelessToken:
         assert mock_db.execute_write.call_count == 2
 
 
+class TestFabricExecuteWriteBatch:
+    """Redeem multiple confirmation tokens in one MCP round-trip.
+
+    Best-effort semantics: each token is verified and executed independently;
+    a failure on one does not roll back earlier successes nor stop later
+    tokens from executing. The response carries per-token status plus
+    succeeded/failed counts.
+    """
+
+    def _make_tokens(self, preview_fn: callable, sqls: list[str]) -> list[str]:
+        tokens = []
+        for sql in sqls:
+            preview = json.loads(preview_fn(sql))
+            tokens.append(preview["confirmation_token"])
+        return tokens
+
+    def test_all_valid_tokens_all_succeed(self) -> None:
+        tools = _make_write_tools()
+        preview_fn, _ = tools["fabric_preview_write"]
+        batch_fn, mock_db = tools["fabric_execute_write_batch"]
+        mock_db.execute_write.return_value = 1
+
+        tokens = self._make_tokens(
+            preview_fn,
+            [
+                "INSERT INTO gold.transactions (id) VALUES (1)",
+                "INSERT INTO gold.transactions (id) VALUES (2)",
+                "INSERT INTO gold.transactions (id) VALUES (3)",
+            ],
+        )
+
+        result = json.loads(batch_fn(tokens))
+
+        assert result["total_succeeded"] == 3
+        assert result["total_failed"] == 0
+        assert len(result["results"]) == 3
+        for r in result["results"]:
+            assert r["status"] == "ok"
+            assert r["affected_rows"] == 1
+            assert r["operation"] == "INSERT"
+            assert r["table"] == "gold.transactions"
+        assert mock_db.execute_write.call_count == 3
+
+    def test_mixed_valid_and_invalid_tokens(self) -> None:
+        """Best-effort: invalid token between valid ones must not abort the batch."""
+        tools = _make_write_tools()
+        preview_fn, _ = tools["fabric_preview_write"]
+        batch_fn, mock_db = tools["fabric_execute_write_batch"]
+        mock_db.execute_write.return_value = 1
+
+        valid_tokens = self._make_tokens(
+            preview_fn,
+            [
+                "INSERT INTO gold.transactions (id) VALUES (1)",
+                "INSERT INTO gold.transactions (id) VALUES (3)",
+            ],
+        )
+        # Slip a garbage token in the middle.
+        all_tokens = [valid_tokens[0], "not-a-real-token", valid_tokens[1]]
+
+        result = json.loads(batch_fn(all_tokens))
+
+        assert result["total_succeeded"] == 2
+        assert result["total_failed"] == 1
+        assert result["results"][0]["status"] == "ok"
+        assert result["results"][1]["status"] == "error"
+        assert result["results"][1]["code"] == "TOKEN_INVALID"
+        assert result["results"][2]["status"] == "ok"
+        # Only the two valid tokens reached the database
+        assert mock_db.execute_write.call_count == 2
+
+    def test_expired_token_in_batch(self) -> None:
+        config = _make_config()
+        tools = _make_write_tools(config=config)
+        batch_fn, mock_db = tools["fabric_execute_write_batch"]
+
+        expired_payload = {
+            "v": _TOKEN_VERSION,
+            "sql": "INSERT INTO gold.transactions (id) VALUES (1)",
+            "op": "INSERT",
+            "table": "gold.transactions",
+            "iat": (datetime.now(tz=UTC) - timedelta(minutes=20)).timestamp(),
+            "exp": (datetime.now(tz=UTC) - timedelta(minutes=5)).timestamp(),
+            "nonce": "0" * 32,
+        }
+        expired_token = _make_token(expired_payload, config.client_secret)
+
+        result = json.loads(batch_fn([expired_token]))
+
+        assert result["total_succeeded"] == 0
+        assert result["total_failed"] == 1
+        assert result["results"][0]["status"] == "error"
+        assert result["results"][0]["code"] == "TOKEN_EXPIRED"
+        mock_db.execute_write.assert_not_called()
+
+    def test_empty_token_list_is_no_op_success(self) -> None:
+        tools = _make_write_tools()
+        batch_fn, mock_db = tools["fabric_execute_write_batch"]
+
+        result = json.loads(batch_fn([]))
+
+        assert result["results"] == []
+        assert result["total_succeeded"] == 0
+        assert result["total_failed"] == 0
+        mock_db.execute_write.assert_not_called()
+
+    def test_batch_size_above_limit_rejected(self) -> None:
+        tools = _make_write_tools()
+        batch_fn, mock_db = tools["fabric_execute_write_batch"]
+
+        # 101 dummy tokens — server should reject the whole batch without
+        # attempting to verify any of them.
+        result = json.loads(batch_fn(["fake"] * 101))
+
+        assert result.get("code") == "INVALID_OPERATION"
+        mock_db.execute_write.assert_not_called()
+
+    def test_database_error_in_one_token_does_not_abort_batch(self) -> None:
+        """If db.execute_write raises mid-batch, the failing token reports
+        QUERY_ERROR but later tokens still execute."""
+        tools = _make_write_tools()
+        preview_fn, _ = tools["fabric_preview_write"]
+        batch_fn, mock_db = tools["fabric_execute_write_batch"]
+
+        # db.execute_write wraps pyodbc errors as ErrorResponse JSON; simulate
+        # that the first token's INSERT hits a constraint violation, while the
+        # next two succeed.
+        err_json = json.dumps({
+            "code": "QUERY_ERROR",
+            "message": "Violation of PRIMARY KEY constraint",
+            "details": None,
+        })
+        mock_db.execute_write.side_effect = [RuntimeError(err_json), 1, 1]
+
+        tokens = self._make_tokens(
+            preview_fn,
+            [
+                "INSERT INTO gold.transactions (id) VALUES (1)",
+                "INSERT INTO gold.transactions (id) VALUES (2)",
+                "INSERT INTO gold.transactions (id) VALUES (3)",
+            ],
+        )
+
+        result = json.loads(batch_fn(tokens))
+
+        assert result["total_succeeded"] == 2
+        assert result["total_failed"] == 1
+        assert result["results"][0]["status"] == "error"
+        assert result["results"][0]["code"] == "QUERY_ERROR"
+        assert result["results"][0]["operation"] == "INSERT"
+        assert result["results"][0]["table"] == "gold.transactions"
+        assert result["results"][1]["status"] == "ok"
+        assert result["results"][2]["status"] == "ok"
+        # All three were attempted
+        assert mock_db.execute_write.call_count == 3
+
+
 class TestFabricDeletePeriod:
     """A narrow DELETE primitive: delete one fiscal period's rows from a
     write-allowlisted fact table. Safer than generic DELETE because the
