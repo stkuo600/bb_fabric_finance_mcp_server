@@ -271,3 +271,125 @@ class TestStatelessToken:
         assert "affected_rows" in result1
         assert "affected_rows" in result2
         assert mock_db.execute_write.call_count == 2
+
+
+class TestFabricDeletePeriod:
+    """A narrow DELETE primitive: delete one fiscal period's rows from a
+    write-allowlisted fact table. Safer than generic DELETE because the
+    WHERE clause is fixed to `FiscalYear = ? AND FiscalMonth = ?`."""
+
+    def _setup_columns_check(self, mock_db: MagicMock, columns: list[str]) -> None:
+        """Make the next execute_query call (the FiscalYear/Month existence
+        check) return the given column names."""
+        mock_db.execute_query.return_value = (
+            [],
+            [{"COLUMN_NAME": c} for c in columns],
+        )
+
+    def test_happy_path_returns_deleted_rows(self) -> None:
+        config = _make_config(write_allowlist=["raw.Fact_ExchangeRate"])
+        tools = _make_write_tools(config=config)
+        fn, mock_db = tools["fabric_delete_period"]
+        self._setup_columns_check(mock_db, ["FiscalYear", "FiscalMonth"])
+        mock_db.execute_write.return_value = 143
+
+        result = json.loads(fn("raw.Fact_ExchangeRate", 2026, 5))
+
+        assert result["deleted_rows"] == 143
+        assert result["table"] == "raw.Fact_ExchangeRate"
+        assert result["fiscal_year"] == 2026
+        assert result["fiscal_month"] == 5
+
+    def test_emits_fixed_where_clause(self) -> None:
+        config = _make_config(write_allowlist=["raw.Fact_ExchangeRate"])
+        tools = _make_write_tools(config=config)
+        fn, mock_db = tools["fabric_delete_period"]
+        self._setup_columns_check(mock_db, ["FiscalYear", "FiscalMonth"])
+        mock_db.execute_write.return_value = 0
+
+        fn("raw.Fact_ExchangeRate", 2026, 5)
+
+        delete_sql = mock_db.execute_write.call_args[0][0]
+        assert delete_sql.upper().startswith("DELETE FROM ")
+        assert "raw.Fact_ExchangeRate" in delete_sql
+        assert "FiscalYear = 2026" in delete_sql
+        assert "FiscalMonth = 5" in delete_sql
+
+    def test_table_not_on_allowlist_rejected(self) -> None:
+        config = _make_config(write_allowlist=["raw.Fact_ExchangeRate"])
+        tools = _make_write_tools(config=config)
+        fn, mock_db = tools["fabric_delete_period"]
+
+        result = json.loads(fn("raw.secret_data", 2026, 5))
+
+        assert result["code"] == "TABLE_NOT_ALLOWED"
+        mock_db.execute_write.assert_not_called()
+
+    def test_unqualified_table_rejected(self) -> None:
+        config = _make_config(write_allowlist=["Fact_ExchangeRate"])
+        tools = _make_write_tools(config=config)
+        fn, mock_db = tools["fabric_delete_period"]
+
+        result = json.loads(fn("Fact_ExchangeRate", 2026, 5))
+
+        assert result["code"] == "INVALID_OPERATION"
+        mock_db.execute_write.assert_not_called()
+
+    def test_missing_fiscal_year_column_rejected(self) -> None:
+        """Dim tables typically lack FiscalYear; the tool must refuse rather
+        than execute a DELETE that would fail with a cryptic SQL error."""
+        config = _make_config(write_allowlist=["raw.Dim_Entity"])
+        tools = _make_write_tools(config=config)
+        fn, mock_db = tools["fabric_delete_period"]
+        self._setup_columns_check(mock_db, ["FiscalMonth"])  # only FiscalMonth
+
+        result = json.loads(fn("raw.Dim_Entity", 2026, 5))
+
+        assert result["code"] == "INVALID_OPERATION"
+        assert "FiscalYear" in result["message"]
+        mock_db.execute_write.assert_not_called()
+
+    def test_missing_fiscal_month_column_rejected(self) -> None:
+        config = _make_config(write_allowlist=["raw.Fact_X"])
+        tools = _make_write_tools(config=config)
+        fn, mock_db = tools["fabric_delete_period"]
+        self._setup_columns_check(mock_db, ["FiscalYear"])
+
+        result = json.loads(fn("raw.Fact_X", 2026, 5))
+
+        assert result["code"] == "INVALID_OPERATION"
+        assert "FiscalMonth" in result["message"]
+        mock_db.execute_write.assert_not_called()
+
+    def test_invalid_month_rejected(self) -> None:
+        config = _make_config(write_allowlist=["raw.Fact_ExchangeRate"])
+        tools = _make_write_tools(config=config)
+        fn, mock_db = tools["fabric_delete_period"]
+
+        for bad in (0, 13, -1, 100):
+            result = json.loads(fn("raw.Fact_ExchangeRate", 2026, bad))
+            assert result["code"] == "INVALID_OPERATION", f"month={bad} should be rejected"
+
+        mock_db.execute_write.assert_not_called()
+
+    def test_invalid_year_rejected(self) -> None:
+        config = _make_config(write_allowlist=["raw.Fact_ExchangeRate"])
+        tools = _make_write_tools(config=config)
+        fn, mock_db = tools["fabric_delete_period"]
+
+        for bad in (-1, 0, 1899, 10000, 99999):
+            result = json.loads(fn("raw.Fact_ExchangeRate", bad, 5))
+            assert result["code"] == "INVALID_OPERATION", f"year={bad} should be rejected"
+
+        mock_db.execute_write.assert_not_called()
+
+    def test_zero_rows_deleted_is_success(self) -> None:
+        """If no rows match the period, that's a successful no-op, not an error."""
+        config = _make_config(write_allowlist=["raw.Fact_ExchangeRate"])
+        tools = _make_write_tools(config=config)
+        fn, mock_db = tools["fabric_delete_period"]
+        self._setup_columns_check(mock_db, ["FiscalYear", "FiscalMonth"])
+        mock_db.execute_write.return_value = 0
+
+        result = json.loads(fn("raw.Fact_ExchangeRate", 2026, 5))
+        assert result["deleted_rows"] == 0

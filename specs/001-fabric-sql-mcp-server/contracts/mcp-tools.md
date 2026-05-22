@@ -120,7 +120,7 @@ Execute a previously previewed write operation using a confirmation token.
 
 ## Tool: `fabric_list_writable_tables`
 
-List tables on the write allowlist — i.e. those that may be the target of `fabric_preview_write` / `fabric_execute_write`.
+List tables on the write allowlist — i.e. those that may be the target of `fabric_preview_write` / `fabric_execute_write` / `fabric_delete_period`.
 
 **Parameters**: none.
 
@@ -134,6 +134,40 @@ List tables on the write allowlist — i.e. those that may be the target of `fab
 **Behavior**:
 - Pure read of server configuration (`write_allowlist` / `FABRIC_WRITE_ALLOWLIST`). No database round-trip.
 - Returns an empty list when no tables are configured.
+
+---
+
+## Tool: `fabric_delete_period`
+
+Delete one fiscal period's rows from an allowlisted fact table. The WHERE clause is fixed — arbitrary DELETE is not supported. Intended for monthly fact-table reload workflows (e.g. FX rate re-import).
+
+**Parameters**:
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| table | string | yes | Schema-qualified target (e.g. `"raw.Fact_ExchangeRate"`). Must be on the write allowlist **and** have both `FiscalYear` and `FiscalMonth` columns. |
+| fiscal_year | integer | yes | Four-digit fiscal year (1900–9999). |
+| fiscal_month | integer | yes | Fiscal month (1–12). |
+
+**Returns** (success):
+```json
+{
+  "deleted_rows": 143,
+  "table": "raw.Fact_ExchangeRate",
+  "fiscal_year": 2026,
+  "fiscal_month": 5
+}
+```
+
+**Returns** (error):
+- `TABLE_NOT_ALLOWED` — target not on the write allowlist.
+- `INVALID_OPERATION` — unqualified table name, year/month out of range, or required `FiscalYear`/`FiscalMonth` column missing on the target.
+
+**Behavior**:
+- Issues `DELETE FROM <table> WHERE FiscalYear = <fy> AND FiscalMonth = <fm>` — no other WHERE conditions are supported.
+- Pre-flight column-existence check against `INFORMATION_SCHEMA.COLUMNS` so dimension tables (which lack fiscal columns) are refused with a clear message rather than a cryptic SQL error.
+- Zero rows deleted is a successful no-op (`{"deleted_rows": 0, ...}`), not an error.
+- Audited via structured log entry containing tool name, table, fiscal_year, fiscal_month, and row count.
 
 ---
 

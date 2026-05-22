@@ -63,6 +63,7 @@ class TestToolRegistration:
             "fabric_preview_write",
             "fabric_execute_write",
             "fabric_list_writable_tables",
+            "fabric_delete_period",
         }
         assert set(tools.keys()) == expected
 

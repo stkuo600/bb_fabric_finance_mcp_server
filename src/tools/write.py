@@ -104,6 +104,138 @@ def register_write_tools(mcp: FastMCP, db: FabricDatabase, config: FabricSetting
     """Register write-related MCP tools."""
 
     @mcp.tool()
+    def fabric_delete_period(table: str, fiscal_year: int, fiscal_month: int) -> str:
+        """Delete one fiscal period's rows from an allowlisted fact table.
+
+        The WHERE clause is fixed to `FiscalYear = ? AND FiscalMonth = ?`;
+        arbitrary DELETE is not supported. Intended for monthly fact-table
+        reload workflows (e.g. FX rate re-import).
+
+        Args:
+            table: Schema-qualified target (e.g. "raw.Fact_ExchangeRate").
+                Must be on the FABRIC_WRITE_ALLOWLIST **and** have both
+                `FiscalYear` and `FiscalMonth` columns.
+            fiscal_year: Four-digit fiscal year (1900-9999).
+            fiscal_month: Fiscal month (1-12).
+
+        Returns:
+            On success: `{"deleted_rows": N, "table": ..., "fiscal_year": ..., "fiscal_month": ...}`.
+            On rejection: `INVALID_OPERATION` (bad args / unqualified table /
+            missing FiscalYear or FiscalMonth columns) or `TABLE_NOT_ALLOWED`.
+        """
+        logger.info(
+            "Delete period requested",
+            extra={
+                "tool": "fabric_delete_period",
+                "table": table,
+                "fiscal_year": fiscal_year,
+                "fiscal_month": fiscal_month,
+            },
+        )
+
+        if not 1900 <= fiscal_year <= 9999:
+            error = ErrorResponse(
+                code="INVALID_OPERATION",
+                message=f"fiscal_year must be 1900-9999; got {fiscal_year}.",
+            )
+            return error.model_dump_json()
+
+        if not 1 <= fiscal_month <= 12:
+            error = ErrorResponse(
+                code="INVALID_OPERATION",
+                message=f"fiscal_month must be 1-12; got {fiscal_month}.",
+            )
+            return error.model_dump_json()
+
+        if "." not in table:
+            error = ErrorResponse(
+                code="INVALID_OPERATION",
+                message="table must be schema-qualified, e.g. 'raw.Fact_ExchangeRate'.",
+            )
+            return error.model_dump_json()
+
+        if not _is_table_allowed(table, config.write_allowlist):
+            allowed_str = ", ".join(config.write_allowlist) if config.write_allowlist else "(none)"
+            error = ErrorResponse(
+                code="TABLE_NOT_ALLOWED",
+                message=f"Table '{table}' is not on the write allowlist",
+                details=f"Allowed tables: {allowed_str}",
+            )
+            logger.warning(
+                "Table not allowed: %s",
+                table,
+                extra={"tool": "fabric_delete_period", "table": table, "error_code": "TABLE_NOT_ALLOWED"},
+            )
+            return error.model_dump_json()
+
+        schema_name, table_name = table.split(".", 1)
+        check_sql = (
+            "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS "
+            f"WHERE TABLE_SCHEMA = '{schema_name}' AND TABLE_NAME = '{table_name}' "
+            "AND COLUMN_NAME IN ('FiscalYear', 'FiscalMonth')"
+        )
+        try:
+            _, col_rows = db.execute_query(check_sql)
+        except RuntimeError as e:
+            logger.error(
+                "Column check failed",
+                extra={"tool": "fabric_delete_period", "error_code": "QUERY_ERROR"},
+            )
+            return str(e)
+
+        found_lower = {str(row["COLUMN_NAME"]).lower() for row in col_rows}
+        required = ("FiscalYear", "FiscalMonth")
+        missing = [c for c in required if c.lower() not in found_lower]
+        if missing:
+            error = ErrorResponse(
+                code="INVALID_OPERATION",
+                message=(
+                    f"Table '{table}' is missing required column(s) {missing}; "
+                    "fabric_delete_period only supports tables with both FiscalYear and FiscalMonth."
+                ),
+            )
+            logger.warning(
+                "Missing fiscal columns: %s",
+                missing,
+                extra={"tool": "fabric_delete_period", "table": table, "missing": missing},
+            )
+            return error.model_dump_json()
+
+        delete_sql = (
+            f"DELETE FROM {table} WHERE FiscalYear = {fiscal_year} AND FiscalMonth = {fiscal_month}"
+        )
+        try:
+            deleted_rows = db.execute_write(delete_sql)
+        except RuntimeError as e:
+            logger.error(
+                "Delete failed",
+                extra={"tool": "fabric_delete_period", "error_code": "QUERY_ERROR"},
+            )
+            return str(e)
+
+        result = {
+            "deleted_rows": deleted_rows,
+            "table": table,
+            "fiscal_year": fiscal_year,
+            "fiscal_month": fiscal_month,
+        }
+        logger.info(
+            "Delete period executed: %s year=%d month=%d rows=%d",
+            table,
+            fiscal_year,
+            fiscal_month,
+            deleted_rows,
+            extra={
+                "tool": "fabric_delete_period",
+                "table": table,
+                "fiscal_year": fiscal_year,
+                "fiscal_month": fiscal_month,
+                "row_count": deleted_rows,
+            },
+        )
+        return json.dumps(result)
+
+    @mcp.tool()
     def fabric_list_writable_tables() -> str:
         """List tables on the write allowlist.
 
