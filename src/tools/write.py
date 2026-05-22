@@ -29,7 +29,6 @@ logger = logging.getLogger("fabric_mcp.tools.write")
 _INSERT_PATTERN = re.compile(r"^\s*INSERT\s+INTO\s+(\S+)", re.IGNORECASE)
 _UPDATE_PATTERN = re.compile(r"^\s*UPDATE\s+(\S+)", re.IGNORECASE)
 
-_TOKEN_EXPIRY_MINUTES = 5
 _TOKEN_VERSION = 1
 _SIGNING_KEY_DOMAIN = b"fabric-mcp-write-confirmation\x00"
 
@@ -291,12 +290,14 @@ def register_write_tools(mcp: FastMCP, db: FabricDatabase, config: FabricSetting
             )
             return error.model_dump_json()
 
-        expires_at = datetime.now(tz=UTC) + timedelta(minutes=_TOKEN_EXPIRY_MINUTES)
+        issued_at = datetime.now(tz=UTC)
+        expires_at = issued_at + timedelta(minutes=config.write_token_expiry_minutes)
         payload = {
             "v": _TOKEN_VERSION,
             "sql": sql,
             "op": operation,
             "table": table,
+            "iat": issued_at.timestamp(),
             "exp": expires_at.timestamp(),
             "nonce": secrets.token_hex(16),
         }

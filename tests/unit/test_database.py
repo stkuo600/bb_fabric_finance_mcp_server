@@ -84,6 +84,89 @@ class TestFabricDatabase:
             db.execute_query("SELECT bad")
 
     @patch("src.database.pyodbc.connect")
+    def test_query_error_without_known_fabric_pattern_has_no_hint(self, mock_connect: MagicMock) -> None:
+        """For non-matching errors, `details` stays None — no false hints."""
+        import json as _json
+
+        import pyodbc
+
+        db, _ = self._make_db()
+        mock_connect.return_value.cursor.return_value.execute.side_effect = pyodbc.Error(
+            "42S02", "Invalid object name 'foo'"
+        )
+
+        try:
+            db.execute_query("SELECT * FROM foo")
+        except RuntimeError as e:
+            payload = _json.loads(str(e))
+            assert payload["code"] == "QUERY_ERROR"
+            assert payload["details"] is None
+
+    @patch("src.database.pyodbc.connect")
+    def test_query_error_identity_overflow_carries_fabric_hint(self, mock_connect: MagicMock) -> None:
+        """Fabric Warehouse cannot widen an existing INT IDENTITY column;
+        the hint nudges the caller toward the recreate-with-BIGINT workaround."""
+        import json as _json
+
+        import pyodbc
+
+        db, _ = self._make_db()
+        mock_connect.return_value.cursor.return_value.execute.side_effect = pyodbc.Error(
+            "22003",
+            "Arithmetic overflow error converting IDENTITY to data type int.",
+        )
+
+        try:
+            db.execute_query("SELECT 1")
+        except RuntimeError as e:
+            payload = _json.loads(str(e))
+            assert payload["code"] == "QUERY_ERROR"
+            assert payload["details"] is not None
+            assert "BIGINT" in payload["details"]
+            # Original error must be preserved in `message`
+            assert "Arithmetic overflow" in payload["message"]
+
+    @patch("src.database.pyodbc.connect")
+    def test_query_error_alter_table_add_column_carries_fabric_hint(self, mock_connect: MagicMock) -> None:
+        import json as _json
+
+        import pyodbc
+
+        db, _ = self._make_db()
+        mock_connect.return_value.cursor.return_value.execute.side_effect = pyodbc.Error(
+            "42000",
+            "ALTER TABLE ADD COLUMN is not supported on Fabric Warehouse.",
+        )
+
+        try:
+            db.execute_query("SELECT 1")
+        except RuntimeError as e:
+            payload = _json.loads(str(e))
+            assert payload["details"] is not None
+            assert "recreate" in payload["details"].lower() or "DROP" in payload["details"]
+            assert "ALTER TABLE ADD COLUMN" in payload["message"]
+
+    @patch("src.database.pyodbc.connect")
+    def test_write_error_propagates_fabric_hint(self, mock_connect: MagicMock) -> None:
+        """The hint logic must apply to execute_write too, not just queries."""
+        import json as _json
+
+        import pyodbc
+
+        db, _ = self._make_db()
+        mock_connect.return_value.cursor.return_value.execute.side_effect = pyodbc.Error(
+            "22003",
+            "Arithmetic overflow error converting IDENTITY to data type int.",
+        )
+
+        try:
+            db.execute_write("INSERT INTO t VALUES (1)")
+        except RuntimeError as e:
+            payload = _json.loads(str(e))
+            assert payload["details"] is not None
+            assert "BIGINT" in payload["details"]
+
+    @patch("src.database.pyodbc.connect")
     def test_execute_write_returns_affected_count(self, mock_connect: MagicMock) -> None:
         db, _ = self._make_db()
 

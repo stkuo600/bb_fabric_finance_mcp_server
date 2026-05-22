@@ -78,7 +78,8 @@ Preview a write operation and receive a confirmation token. Does NOT execute the
 **Behavior**:
 - Only INSERT and UPDATE statements are accepted.
 - Target table must be on the configured write allowlist.
-- Token expires after 5 minutes.
+- Token expires after `write_token_expiry_minutes` (default 15, configurable 1–60 via `FABRIC_WRITE_TOKEN_EXPIRY_MINUTES`).
+- Token payload carries `iat` (issued-at, POSIX seconds) alongside `exp` for forensic / audit use; `iat` is informational only and is not enforced by the verifier.
 - Does NOT execute the SQL — only validates and returns a preview.
 
 ---
@@ -267,3 +268,11 @@ Get column details for a specific table.
 | TOKEN_EXPIRED | Write confirmation token has expired |
 | TOKEN_INVALID | Write confirmation token is missing, malformed, or has an invalid signature |
 | CONFIG_ERROR | Server misconfiguration |
+
+### `QUERY_ERROR` details: Fabric-specific remediation hints
+
+When a `QUERY_ERROR` response is generated, the `details` field carries a remediation hint when the underlying Fabric/SQL Server message matches a known limitation. The raw error stays in `message`. Known patterns:
+
+- **IDENTITY overflow** (`message` contains "IDENTITY" + "overflow"/"arithmetic"): "Fabric Warehouse does not support widening an existing IDENTITY column via ALTER. Recreate the table with BIGINT IDENTITY and reload the data."
+- **Unsupported `ALTER TABLE` DDL** (`message` contains an ALTER TABLE ADD/ALTER COLUMN reference flagged as unsupported): "Fabric Warehouse does not support ALTER TABLE ADD/ALTER COLUMN. DROP the table and recreate it with the desired schema, then reload the data."
+- **No match**: `details` is `null` (no hint injected).

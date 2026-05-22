@@ -54,6 +54,7 @@ class FabricSettings(BaseSettings):
     write_allowlist: Annotated[list[str], NoDecode] = []
     max_rows: int = 500
     port: int = 8000
+    write_token_expiry_minutes: int = 15
 
     @classmethod
     def settings_customise_sources(
@@ -83,6 +84,14 @@ class FabricSettings(BaseSettings):
     def validate_max_rows(cls, v: int) -> int:
         if not 1 <= v <= 10000:
             msg = "max_rows must be between 1 and 10000"
+            raise ValueError(msg)
+        return v
+
+    @field_validator("write_token_expiry_minutes")
+    @classmethod
+    def validate_write_token_expiry_minutes(cls, v: int) -> int:
+        if not 1 <= v <= 60:
+            msg = "write_token_expiry_minutes must be between 1 and 60"
             raise ValueError(msg)
         return v
 

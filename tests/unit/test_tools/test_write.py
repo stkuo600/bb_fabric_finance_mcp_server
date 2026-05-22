@@ -251,6 +251,47 @@ class TestStatelessToken:
         result = json.loads(execute_b(token))
         assert result["code"] == "TOKEN_INVALID"
 
+    def test_token_payload_contains_issued_at(self) -> None:
+        """Tokens carry an `iat` (issued-at) POSIX timestamp for forensic
+        purposes, in addition to the existing `exp`."""
+        import base64
+        import time as time_module
+
+        config = _make_config()
+        tools = _make_write_tools(config=config)
+        preview_fn, _ = tools["fabric_preview_write"]
+
+        before = time_module.time()
+        preview = json.loads(preview_fn("INSERT INTO gold.transactions (id) VALUES (1)"))
+        after = time_module.time()
+        token = preview["confirmation_token"]
+
+        # Decode the payload portion (no signature verification here — we trust
+        # the token we just minted; only inspecting the JSON shape).
+        payload_b64 = token.split(".", 1)[0]
+        padded = payload_b64 + "=" * (-len(payload_b64) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(padded))
+
+        assert "iat" in payload
+        assert before - 1 <= payload["iat"] <= after + 1
+
+    def test_token_expiry_uses_configured_minutes(self) -> None:
+        """The token's `exp` is `iat + write_token_expiry_minutes * 60`."""
+        import base64
+
+        config = _make_config(write_token_expiry_minutes=30)
+        tools = _make_write_tools(config=config)
+        preview_fn, _ = tools["fabric_preview_write"]
+
+        preview = json.loads(preview_fn("INSERT INTO gold.transactions (id) VALUES (1)"))
+        token = preview["confirmation_token"]
+        payload_b64 = token.split(".", 1)[0]
+        padded = payload_b64 + "=" * (-len(payload_b64) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(padded))
+
+        # Allow 5-second slack for clock skew between the two captures.
+        assert 30 * 60 - 5 <= payload["exp"] - payload["iat"] <= 30 * 60 + 5
+
     def test_token_replay_within_window_succeeds(self) -> None:
         """Stateless tokens are replayable within the validity window. This is
         a deliberate behavioural deviation from the original spec

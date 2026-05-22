@@ -38,6 +38,32 @@ def _is_connection_error(exc: pyodbc.Error) -> bool:
     return isinstance(sqlstate, str) and sqlstate.startswith("08")
 
 
+def _hint_for_fabric_error(message: str) -> str | None:
+    """Return a Fabric-specific remediation hint for a known error pattern.
+
+    Returns None when the message does not match any known pattern, leaving
+    `details` untouched so we never inject misleading guidance.
+    """
+    lower = message.lower()
+
+    if "identity" in lower and ("overflow" in lower or "arithmetic" in lower):
+        return (
+            "Fabric Warehouse does not support widening an existing IDENTITY column "
+            "via ALTER. Recreate the table with BIGINT IDENTITY and reload the data."
+        )
+
+    if (
+        ("alter table" in lower and "add" in lower and "column" in lower)
+        or ("alter column" in lower and ("not supported" in lower or "unsupported" in lower))
+    ):
+        return (
+            "Fabric Warehouse does not support ALTER TABLE ADD/ALTER COLUMN. "
+            "DROP the table and recreate it with the desired schema, then reload the data."
+        )
+
+    return None
+
+
 class FabricDatabase:
     """Manages a long-lived pyodbc connection to a Microsoft Fabric data warehouse.
 
@@ -126,7 +152,12 @@ class FabricDatabase:
                         )
                         self._discard_connection()
                         continue
-                    error = ErrorResponse(code="QUERY_ERROR", message=str(e), details=None)
+                    message = str(e)
+                    error = ErrorResponse(
+                        code="QUERY_ERROR",
+                        message=message,
+                        details=_hint_for_fabric_error(message),
+                    )
                     raise RuntimeError(error.model_dump_json()) from e
             raise RuntimeError("unreachable")  # pragma: no cover
 
@@ -156,6 +187,11 @@ class FabricDatabase:
                         )
                         self._discard_connection()
                         continue
-                    error = ErrorResponse(code="QUERY_ERROR", message=str(e), details=None)
+                    message = str(e)
+                    error = ErrorResponse(
+                        code="QUERY_ERROR",
+                        message=message,
+                        details=_hint_for_fabric_error(message),
+                    )
                     raise RuntimeError(error.model_dump_json()) from e
             raise RuntimeError("unreachable")  # pragma: no cover

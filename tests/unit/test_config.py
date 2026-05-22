@@ -53,6 +53,24 @@ class TestFabricSettings:
         settings = FabricSettings(**self._valid_params(max_rows=10000))
         assert settings.max_rows == 10000
 
+    def test_write_token_expiry_default_is_15_minutes(self) -> None:
+        clean_env = {k: v for k, v in os.environ.items() if not k.startswith("FABRIC_")}
+        with patch.dict(os.environ, clean_env, clear=True), patch("src.config._CONFIG_FILE", Path("/nonexistent")):
+            settings = FabricSettings(**self._valid_params())
+        assert settings.write_token_expiry_minutes == 15
+
+    def test_write_token_expiry_validation(self) -> None:
+        with pytest.raises(ValueError):
+            FabricSettings(**self._valid_params(write_token_expiry_minutes=0))
+        with pytest.raises(ValueError):
+            FabricSettings(**self._valid_params(write_token_expiry_minutes=61))
+
+    def test_write_token_expiry_valid_range(self) -> None:
+        settings = FabricSettings(**self._valid_params(write_token_expiry_minutes=1))
+        assert settings.write_token_expiry_minutes == 1
+        settings = FabricSettings(**self._valid_params(write_token_expiry_minutes=60))
+        assert settings.write_token_expiry_minutes == 60
+
     def test_write_allowlist_from_string(self) -> None:
         settings = FabricSettings(**self._valid_params(write_allowlist="gold.t1, gold.t2"))
         assert settings.write_allowlist == ["gold.t1", "gold.t2"]
