@@ -27,15 +27,46 @@ def _build_token_bytes(token: str) -> bytes:
     return struct.pack(f"<I{len(encoded)}s", len(encoded), encoded)
 
 
-def _is_connection_error(exc: pyodbc.Error) -> bool:
-    """Return True if the pyodbc error is a connection-class failure.
+_CONNECTION_SQLSTATE_PREFIXES = ("08", "IMC", "HYT")
 
-    SQLSTATE class "08" is the ISO SQL "connection exception" class
-    (e.g. 08S01 communication link failure, 08001 unable to connect,
-    08003 connection not open, 08S02 connection name in use).
+# Fragments of MS-ODBC English diagnostic strings that signal a dead/suspect
+# connection even when wrapped in a generic SQLSTATE (most commonly HY000).
+# Kept narrow to avoid misclassifying genuine query-side HY000 errors as
+# connection failures.
+_CONNECTION_MESSAGE_FRAGMENTS = (
+    "communication link",
+    "tcp provider",
+    "connection is broken",
+    "connection forcibly closed",
+    "server has terminated the connection",
+)
+
+
+def _is_connection_error(exc: pyodbc.Error) -> bool:
+    """Return True if the pyodbc error signals a dead/suspect connection.
+
+    Matches SQLSTATEs the Microsoft ODBC driver actually emits on idle
+    disconnect and broken-connection scenarios against Fabric / Azure SQL:
+
+    - ``08*`` — ISO SQL connection-exception class (e.g. ``08S01``
+      communication link failure, ``08001`` unable to connect).
+    - ``IMC*`` — Microsoft connection-resiliency states (``IMC01`` recovery
+      failed, ``IMC05`` server-marked unrecoverable, ``IMC06`` client-driver
+      marked unrecoverable — once set, the driver refuses to attempt
+      recovery, so every subsequent query returns ``IMC06`` until the
+      connection is rebuilt).
+    - ``HYT*`` — connection / query timeout (``HYT00``, ``HYT01``).
+
+    Falls back to a narrow substring scan of the error message for cases
+    where the SQLSTATE is generic (``HY000``) but the driver-supplied text
+    contains a known connection-failure phrase. Microsoft Learn:
+    *Connection resiliency in the ODBC driver*.
     """
     sqlstate = exc.args[0] if exc.args else ""
-    return isinstance(sqlstate, str) and sqlstate.startswith("08")
+    if isinstance(sqlstate, str) and sqlstate.startswith(_CONNECTION_SQLSTATE_PREFIXES):
+        return True
+    text = str(exc).lower()
+    return any(fragment in text for fragment in _CONNECTION_MESSAGE_FRAGMENTS)
 
 
 def _hint_for_fabric_error(message: str) -> str | None:
@@ -84,7 +115,13 @@ class FabricDatabase:
             f"SERVER={server},1433;"
             f"DATABASE={database};"
             f"Encrypt=yes;"
-            f"TrustServerCertificate=no"
+            f"TrustServerCertificate=no;"
+            # Driver-level idle connection resiliency. Up to 3 silent
+            # reconnect attempts (10s apart) before surfacing an error —
+            # handles the common Fabric idle-disconnect case transparently.
+            # Supported on Fabric SQL database per MS Learn "Connection
+            # resiliency in the ODBC driver".
+            f"ConnectRetryCount=3;ConnectRetryInterval=10"
         )
         self._conn: pyodbc.Connection | None = None
         self._lock = threading.Lock()
