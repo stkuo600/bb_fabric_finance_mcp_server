@@ -7,7 +7,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from src.database import FabricDatabase, _build_token_bytes
+from src.database import FabricDatabase, _build_token_bytes, _is_connection_error
 
 
 class TestBuildTokenBytes:
@@ -326,17 +326,184 @@ class TestConnectionReuse:
         )
 
 
-class TestStaleConnectionRecovery:
-    """Stale-connection recovery across the broader set of SQLSTATEs Fabric/MS-ODBC
-    actually emits on idle disconnect — not just ISO `08*`.
+class TestExecuteWithRetry:
+    """Direct tests of the retry seam — exercise the policy in isolation
+    with a fake operation, so retry semantics can change without churning
+    the cursor/description/fetchall scaffolding."""
 
-    Reproduces `.claude/bugfix/2026-05-22-stale-conn-imc06-not-retried/repro.md`:
-    Fabric drops idle TCP connections; the driver surfaces the failure as
-    `HY000` (generic wrapper with TCP-layer message), `IMC06` (driver-side
-    "unrecoverable" marker — emitted with no round trip on every subsequent
-    call), or `HYT*` (connection timeout). The pre-fix classifier matched
-    only `08*`, so these never triggered reconnect and the cached stale
-    connection persisted indefinitely.
+    def _make_db(self) -> tuple[FabricDatabase, MagicMock]:
+        mock_auth = MagicMock()
+        mock_auth.get_token.return_value = "test-access-token"
+        db = FabricDatabase(
+            server="test.datawarehouse.fabric.microsoft.com",
+            database="gold_warehouse",
+            auth=mock_auth,
+        )
+        return db, mock_auth
+
+    @patch("src.database.pyodbc.connect")
+    def test_calls_op_once_on_success(self, mock_connect: MagicMock) -> None:
+        db, _ = self._make_db()
+        mock_connect.return_value = MagicMock(name="conn")
+
+        calls: list[object] = []
+
+        def op(conn: object) -> str:
+            calls.append(conn)
+            return "result"
+
+        result = db._execute_with_retry(op, op_label="test")
+
+        assert result == "result"
+        assert len(calls) == 1
+        assert mock_connect.call_count == 1
+
+    @patch("src.database.pyodbc.connect")
+    def test_retries_op_once_after_connection_class_error(
+        self, mock_connect: MagicMock
+    ) -> None:
+        import pyodbc
+
+        db, _ = self._make_db()
+        broken_conn = MagicMock(name="broken_conn")
+        good_conn = MagicMock(name="good_conn")
+        mock_connect.side_effect = [broken_conn, good_conn]
+
+        calls: list[object] = []
+
+        def op(conn: object) -> str:
+            calls.append(conn)
+            if len(calls) == 1:
+                raise pyodbc.Error("IMC06", "connection broken")
+            return "recovered"
+
+        result = db._execute_with_retry(op, op_label="test")
+
+        assert result == "recovered"
+        assert len(calls) == 2
+        assert mock_connect.call_count == 2
+        broken_conn.close.assert_called()  # stale conn discarded
+
+    @patch("src.database.pyodbc.connect")
+    def test_non_connection_error_raises_fabric_query_error_without_retry(
+        self, mock_connect: MagicMock
+    ) -> None:
+        import pyodbc
+
+        from src.database import FabricQueryError
+
+        db, _ = self._make_db()
+        mock_connect.return_value = MagicMock(name="conn")
+
+        calls: list[object] = []
+
+        def op(conn: object) -> object:
+            calls.append(conn)
+            raise pyodbc.Error("42S02", "Invalid object name 'x'")
+
+        with pytest.raises(FabricQueryError) as exc_info:
+            db._execute_with_retry(op, op_label="test")
+
+        assert exc_info.value.sqlstate == "42S02"
+        assert len(calls) == 1  # no retry
+        assert mock_connect.call_count == 1
+
+    @patch("src.database.pyodbc.connect")
+    def test_second_attempt_failure_raises_fabric_query_error(
+        self, mock_connect: MagicMock
+    ) -> None:
+        """If the reconnect-and-retry attempt also fails with a
+        connection error, surface FabricQueryError — don't loop forever."""
+        import pyodbc
+
+        from src.database import FabricQueryError
+
+        db, _ = self._make_db()
+        mock_connect.side_effect = [MagicMock(name="c1"), MagicMock(name="c2")]
+
+        def op(conn: object) -> object:
+            raise pyodbc.Error("IMC06", "still broken")
+
+        with pytest.raises(FabricQueryError) as exc_info:
+            db._execute_with_retry(op, op_label="test")
+
+        assert exc_info.value.sqlstate == "IMC06"
+        assert mock_connect.call_count == 2  # exactly one retry, no infinite loop
+
+
+class TestIsConnectionError:
+    """Pure-function tests of the SQLSTATE/message classifier. Each
+    SQLSTATE family is asserted independently — no DB, no cursor mocks.
+    The helper-seam test in TestExecuteWithRetry exercises the wiring
+    that turns a True classification into a discard-and-retry.
+    """
+
+    def test_iso_08_class_is_connection_error(self) -> None:
+        import pyodbc
+
+        assert _is_connection_error(pyodbc.Error("08S01", "communication link failure"))
+        assert _is_connection_error(pyodbc.Error("08001", "unable to connect"))
+        assert _is_connection_error(pyodbc.Error("08003", "connection not open"))
+
+    def test_imc_class_is_connection_error(self) -> None:
+        """IMC* = Microsoft driver-side resiliency states. Once the
+        driver sets IMC06, every subsequent cursor.execute returns
+        IMC06 instantly with no round trip — discard is mandatory."""
+        import pyodbc
+
+        assert _is_connection_error(pyodbc.Error("IMC06", "client unrecoverable"))
+        assert _is_connection_error(pyodbc.Error("IMC01", "recovery exhausted"))
+        assert _is_connection_error(pyodbc.Error("IMC05", "server unrecoverable"))
+
+    def test_hyt_class_is_connection_error(self) -> None:
+        import pyodbc
+
+        assert _is_connection_error(pyodbc.Error("HYT00", "Connection timeout expired"))
+        assert _is_connection_error(pyodbc.Error("HYT01", "Login timeout"))
+
+    def test_hy000_with_communication_link_failure_is_connection_error(self) -> None:
+        """Generic SQLSTATE but the message fragment signals a real
+        disconnect — the message-text fallback catches this."""
+        import pyodbc
+
+        assert _is_connection_error(
+            pyodbc.Error("HY000", "[Microsoft]Communication link failure")
+        )
+
+    def test_hy000_with_tcp_provider_reset_is_connection_error(self) -> None:
+        """Production-observed: WSAECONNRESET wrapped in HY000."""
+        import pyodbc
+
+        assert _is_connection_error(
+            pyodbc.Error("HY000", "[TCP Provider] Error code 0x2746 (10054)")
+        )
+
+    def test_hy000_with_unrelated_message_is_not_connection_error(self) -> None:
+        """Guard against the message-text fallback being too eager —
+        a generic HY000 with no known disconnect phrase must NOT
+        trigger reconnect."""
+        import pyodbc
+
+        assert not _is_connection_error(pyodbc.Error("HY000", "unrelated generic error"))
+
+    def test_query_side_sqlstates_are_not_connection_errors(self) -> None:
+        """42S02 (object not found), 22003 (overflow) etc. are
+        legitimate query failures — must not be misclassified."""
+        import pyodbc
+
+        assert not _is_connection_error(pyodbc.Error("42S02", "Invalid object name"))
+        assert not _is_connection_error(pyodbc.Error("22003", "Arithmetic overflow"))
+        assert not _is_connection_error(pyodbc.Error("42000", "syntax error"))
+
+
+class TestStaleConnectionRecovery:
+    """End-to-end wiring smoke test through execute_query + the connection
+    string content guard. SQLSTATE classification details live in
+    TestIsConnectionError; retry policy in TestExecuteWithRetry. Keep
+    this class small — it only verifies the seams compose, not the
+    decisions inside each seam.
+
+    Reproduces `.claude/bugfix/2026-05-22-stale-conn-imc06-not-retried/repro.md`.
     """
 
     def _make_db(self) -> tuple[FabricDatabase, MagicMock]:
@@ -349,181 +516,38 @@ class TestStaleConnectionRecovery:
         )
         return db, mock_auth
 
-    def _good_conn(self, rows: list[tuple[object, ...]] | None = None) -> MagicMock:
-        conn = MagicMock(name="good_conn")
-        cursor = MagicMock()
-        cursor.description = [("id", int, None, None, None, None, False)]
-        cursor.fetchall.return_value = rows if rows is not None else []
-        cursor.rowcount = 0
-        conn.cursor.return_value = cursor
-        return conn
-
-    def _broken_conn(self, sqlstate: str, message: str) -> MagicMock:
+    @patch("src.database.pyodbc.connect")
+    def test_execute_query_reconnects_through_imc06_end_to_end(
+        self, mock_connect: MagicMock
+    ) -> None:
+        """Production-realistic IMC06 chain — classifier + helper +
+        execute_query must wire together to recover transparently."""
         import pyodbc
 
-        conn = MagicMock(name=f"broken_conn_{sqlstate}")
-        cursor = MagicMock()
-        cursor.execute.side_effect = pyodbc.Error(sqlstate, message)
-        conn.cursor.return_value = cursor
-        return conn
-
-    @patch("src.database.pyodbc.connect")
-    def test_reconnects_on_imc06_sqlstate(self, mock_connect: MagicMock) -> None:
-        """IMC06 = client driver marked the connection unrecoverable.
-        Microsoft docs: 'No attempt was made to restore the connection.'
-        The MCP server must therefore discard and rebuild."""
         db, _ = self._make_db()
-        broken = self._broken_conn(
-            "IMC06",
-            "[IMC06] [Microsoft][ODBC Driver 18 for SQL Server]"
-            "The connection is broken and recovery is not possible. "
-            "The connection is marked by the client driver as unrecoverable.",
-        )
-        good = self._good_conn(rows=[(42,)])
-        mock_connect.side_effect = [broken, good]
 
-        columns, rows = db.execute_query("SELECT 1")
-
-        assert mock_connect.call_count == 2, (
-            "expected one reconnect after IMC06 (client-driver unrecoverable marker)"
-        )
-        assert rows == [{"id": 42}]
-        broken.close.assert_called()
-
-    @patch("src.database.pyodbc.connect")
-    def test_reconnects_on_imc01_sqlstate(self, mock_connect: MagicMock) -> None:
-        """IMC01 = driver tried ConnectRetryCount-bounded recovery and gave up.
-        Application must still reconnect on the next call."""
-        db, _ = self._make_db()
-        broken = self._broken_conn(
-            "IMC01",
-            "[IMC01] The connection is broken and recovery is not possible. "
-            "The client driver attempted to recover the connection one or more "
-            "times and all attempts failed.",
-        )
-        good = self._good_conn()
-        mock_connect.side_effect = [broken, good]
-
-        db.execute_query("SELECT 1")
-
-        assert mock_connect.call_count == 2
-        broken.close.assert_called()
-
-    @patch("src.database.pyodbc.connect")
-    def test_reconnects_on_hy000_with_communication_link_failure(
-        self, mock_connect: MagicMock
-    ) -> None:
-        """HY000 with a TCP/communication-link message text — the generic
-        wrapper Fabric/MS-ODBC sometimes surfaces on server-side disconnect."""
-        db, _ = self._make_db()
-        broken = self._broken_conn(
-            "HY000",
-            "[HY000] [Microsoft][ODBC Driver 18 for SQL Server]"
-            "Communication link failure",
-        )
-        good = self._good_conn(rows=[(1,)])
-        mock_connect.side_effect = [broken, good]
-
-        _, rows = db.execute_query("SELECT 1")
-
-        assert mock_connect.call_count == 2, (
-            "expected reconnect on HY000 carrying a connection-failure message"
-        )
-        assert rows == [{"id": 1}]
-        broken.close.assert_called()
-
-    @patch("src.database.pyodbc.connect")
-    def test_reconnects_on_hy000_with_tcp_provider_reset(
-        self, mock_connect: MagicMock
-    ) -> None:
-        """The user-reported error chain on the production incident:
-        HY000 with TCP Provider 0x2746 (WSAECONNRESET)."""
-        db, _ = self._make_db()
-        broken = self._broken_conn(
-            "HY000",
-            "[HY000] [Microsoft][ODBC Driver 18 for SQL Server]"
-            "[TCP Provider] Error code 0x2746 (10054)",
-        )
-        good = self._good_conn()
-        mock_connect.side_effect = [broken, good]
-
-        db.execute_query("SELECT 1")
-
-        assert mock_connect.call_count == 2
-        broken.close.assert_called()
-
-    @patch("src.database.pyodbc.connect")
-    def test_reconnects_on_hyt00_connection_timeout(
-        self, mock_connect: MagicMock
-    ) -> None:
-        """HYT00 / HYT01 = connection or query timeout — connection state
-        is suspect after a timeout, discard and reconnect."""
-        db, _ = self._make_db()
-        broken = self._broken_conn(
-            "HYT00",
-            "[HYT00] [Microsoft][ODBC Driver 18 for SQL Server]Connection timeout expired",
-        )
-        good = self._good_conn()
-        mock_connect.side_effect = [broken, good]
-
-        db.execute_query("SELECT 1")
-
-        assert mock_connect.call_count == 2
-        broken.close.assert_called()
-
-    @patch("src.database.pyodbc.connect")
-    def test_write_reconnects_on_imc06(self, mock_connect: MagicMock) -> None:
-        """execute_write must apply the same broadened classification."""
-        db, _ = self._make_db()
         broken = MagicMock(name="broken")
         broken_cursor = MagicMock()
-        import pyodbc
-
         broken_cursor.execute.side_effect = pyodbc.Error(
-            "IMC06", "client driver marked unrecoverable"
+            "IMC06",
+            "[IMC06] [Microsoft][ODBC Driver 18 for SQL Server]"
+            "The connection is broken and recovery is not possible.",
         )
         broken.cursor.return_value = broken_cursor
 
         good = MagicMock(name="good")
         good_cursor = MagicMock()
-        good_cursor.rowcount = 3
+        good_cursor.description = [("id", int, None, None, None, None, False)]
+        good_cursor.fetchall.return_value = [(42,)]
         good.cursor.return_value = good_cursor
 
         mock_connect.side_effect = [broken, good]
 
-        affected = db.execute_write("UPDATE t SET c = 1")
+        _, rows = db.execute_query("SELECT 1")
 
-        assert affected == 3
         assert mock_connect.call_count == 2
+        assert rows == [{"id": 42}]
         broken.close.assert_called()
-
-    @patch("src.database.pyodbc.connect")
-    def test_genuine_query_error_still_does_not_reconnect(
-        self, mock_connect: MagicMock
-    ) -> None:
-        """Regression guard for the broadened classifier — non-connection
-        SQLSTATEs (42S02, 22003, etc.) must NOT trigger reconnect."""
-        import pyodbc
-
-        from src.database import FabricQueryError
-
-        db, _ = self._make_db()
-        bad_cursor = MagicMock()
-        bad_cursor.execute.side_effect = pyodbc.Error(
-            "42S02", "Invalid object name 'no_such_table'"
-        )
-        good_cursor = MagicMock()
-        good_cursor.description = [("id", int, None, None, None, None, False)]
-        good_cursor.fetchall.return_value = []
-        mock_connect.return_value.cursor.side_effect = [bad_cursor, good_cursor]
-
-        with pytest.raises(FabricQueryError):
-            db.execute_query("SELECT * FROM no_such_table")
-        db.execute_query("SELECT 1")
-
-        assert mock_connect.call_count == 1, (
-            "syntax/object-name errors must not be misclassified as connection errors"
-        )
 
     @patch("src.database.pyodbc.connect")
     def test_connection_string_enables_idle_resiliency(
