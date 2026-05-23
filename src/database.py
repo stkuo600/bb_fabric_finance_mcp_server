@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import logging
 import struct
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TypeVar
@@ -18,6 +20,16 @@ from src.models import ColumnInfo
 logger = logging.getLogger("fabric_mcp.database")
 
 _T = TypeVar("_T")
+
+
+def _sql_hash(sql: str) -> str:
+    """Stable 16-hex-char fingerprint of a SQL string for log correlation.
+
+    Short enough for log readability; long enough to disambiguate the
+    queries an operator is likely to be looking at simultaneously. Not
+    a security boundary — full SHA-256 truncated to 64 bits.
+    """
+    return hashlib.sha256(sql.encode("utf-8")).hexdigest()[:16]
 
 
 @dataclass
@@ -144,7 +156,19 @@ class FabricDatabase:
             # handles the common Fabric idle-disconnect case transparently.
             # Supported on Fabric SQL database per MS Learn "Connection
             # resiliency in the ODBC driver".
-            f"ConnectRetryCount=3;ConnectRetryInterval=10"
+            f"ConnectRetryCount=3;ConnectRetryInterval=10;"
+            # TCP keep-alive: send a probe after 10s of socket idleness.
+            # Driver default is 30s, which is too late for heavy Fabric
+            # views whose silent-compute window (~20s observed) gets the
+            # connection killed by an Azure-side intermediary before any
+            # probe fires. See .claude/bugfix/2026-05-23-fabric-08s01-
+            # mid-query-tcp-drop. KeepAliveInterval=1s = probe retransmit
+            # cadence if no ack received.
+            f"KeepAlive=10;KeepAliveInterval=1;"
+            # Surfaces in Fabric queryinsights.exec_requests_history.
+            # program_name so DBAs can filter requests originating from
+            # this MCP server in server-side telemetry.
+            f"APP=fabric-mcp"
         )
         self._conn: pyodbc.Connection | None = None
         self._lock = threading.Lock()
@@ -175,48 +199,92 @@ class FabricDatabase:
 
     def _execute_with_retry(
         self,
-        operation: Callable[[pyodbc.Connection], _T],
+        operation: Callable[[pyodbc.Connection], tuple[_T, int]],
         *,
         op_label: str,
+        sql_for_hash: str,
     ) -> _T:
         """Run ``operation`` against the cached connection with one immediate
         reconnect-and-retry on connection-class pyodbc errors.
 
-        ``operation`` receives the live ``pyodbc.Connection`` and returns
-        whatever the caller needs (cursor results, row count, etc.). On a
-        connection-class failure (per ``_is_connection_error``) the cached
-        connection is discarded, a fresh one is opened, and ``operation``
-        runs once more. On any other ``pyodbc.Error`` — or a second
-        connection-class failure — a ``FabricQueryError`` is raised
-        carrying the Fabric-specific hint (if any) and the originating
-        SQLSTATE.
+        ``operation`` receives the live ``pyodbc.Connection`` and must
+        return ``(result, row_count)``. The helper owns timing + retry +
+        logging so every attempt — success, retry, or final failure —
+        is observable through a uniform set of structured fields:
+
+        - ``query_duration_ms`` — perf_counter delta around the operation
+        - ``attempt`` — 0 for the first try, 1 for the post-reconnect retry
+        - ``sql_hash`` — stable fingerprint of ``sql_for_hash`` so the
+          three attempt records can be correlated without exposing the
+          full SQL
+
+        On a connection-class failure (per ``_is_connection_error``) the
+        cached connection is discarded, a fresh one is opened, and
+        ``operation`` runs once more. On any other ``pyodbc.Error`` — or
+        a second connection-class failure — a ``FabricQueryError`` is
+        raised carrying the Fabric-specific hint (if any) and the
+        originating SQLSTATE.
 
         Concurrency: the cached connection is serialised with ``_lock`` —
         pyodbc connections are not safe for concurrent cursor use, and
         FastMCP's ``streamable-http`` transport can dispatch sync tools
         to multiple worker threads.
         """
+        h = _sql_hash(sql_for_hash)
         with self._lock:
             for attempt in (0, 1):
+                t0 = time.perf_counter()
                 try:
-                    return operation(self._get_connection())
+                    result, row_count = operation(self._get_connection())
                 except pyodbc.Error as e:
+                    duration_ms = int((time.perf_counter() - t0) * 1000)
+                    sqlstate = e.args[0] if e.args and isinstance(e.args[0], str) else None
                     if attempt == 0 and _is_connection_error(e):
                         logger.warning(
                             "Connection-class error, reconnecting and retrying",
                             extra={
                                 "operation": op_label,
-                                "sqlstate": e.args[0] if e.args else "",
+                                "sqlstate": sqlstate or "",
+                                "attempt": attempt,
+                                "query_duration_ms": duration_ms,
+                                "sql_hash": h,
                             },
                         )
                         self._discard_connection()
                         continue
+                    logger.error(
+                        "%s failed after attempt %d",
+                        op_label,
+                        attempt,
+                        extra={
+                            "operation": op_label,
+                            "sqlstate": sqlstate or "",
+                            "attempt": attempt,
+                            "query_duration_ms": duration_ms,
+                            "sql_hash": h,
+                        },
+                    )
                     message = str(e)
                     raise FabricQueryError(
                         message=message,
                         details=_hint_for_fabric_error(message),
-                        sqlstate=e.args[0] if e.args and isinstance(e.args[0], str) else None,
+                        sqlstate=sqlstate,
                     ) from e
+                else:
+                    duration_ms = int((time.perf_counter() - t0) * 1000)
+                    logger.info(
+                        "%s executed: %d rows",
+                        op_label.capitalize(),
+                        row_count,
+                        extra={
+                            "operation": op_label,
+                            "row_count": row_count,
+                            "query_duration_ms": duration_ms,
+                            "sql_hash": h,
+                            "attempt": attempt,
+                        },
+                    )
+                    return result
             raise RuntimeError("unreachable")  # pragma: no cover
 
     def execute_query(self, sql: str, timeout: int = 30) -> tuple[list[ColumnInfo], list[dict[str, object]]]:
@@ -225,7 +293,9 @@ class FabricDatabase:
         Returns (columns, rows) where rows are dicts keyed by column name.
         Raises FabricQueryError on failure (code, message, details, sqlstate).
         """
-        def op(conn: pyodbc.Connection) -> tuple[list[ColumnInfo], list[dict[str, object]]]:
+        def op(
+            conn: pyodbc.Connection,
+        ) -> tuple[tuple[list[ColumnInfo], list[dict[str, object]]], int]:
             conn.timeout = timeout
             cursor = conn.cursor()
             cursor.execute(sql)
@@ -239,29 +309,19 @@ class FabricDatabase:
             ]
             col_names = [c.name for c in columns]
             rows = [dict(zip(col_names, row, strict=False)) for row in cursor.fetchall()]
-            logger.info(
-                "Query executed: %d rows",
-                len(rows),
-                extra={"operation": "query", "row_count": len(rows)},
-            )
-            return columns, rows
+            return (columns, rows), len(rows)
 
-        return self._execute_with_retry(op, op_label="query")
+        return self._execute_with_retry(op, op_label="query", sql_for_hash=sql)
 
     def execute_write(self, sql: str) -> int:
         """Execute a write SQL statement (INSERT/UPDATE) and return affected row count.
 
         Raises FabricQueryError on failure (code, message, details, sqlstate).
         """
-        def op(conn: pyodbc.Connection) -> int:
+        def op(conn: pyodbc.Connection) -> tuple[int, int]:
             cursor = conn.cursor()
             cursor.execute(sql)
             affected = cursor.rowcount
-            logger.info(
-                "Write executed: %d rows affected",
-                affected,
-                extra={"operation": "write", "row_count": affected},
-            )
-            return affected
+            return affected, affected
 
-        return self._execute_with_retry(op, op_label="write")
+        return self._execute_with_retry(op, op_label="write", sql_for_hash=sql)

@@ -348,11 +348,11 @@ class TestExecuteWithRetry:
 
         calls: list[object] = []
 
-        def op(conn: object) -> str:
+        def op(conn: object) -> tuple[str, int]:
             calls.append(conn)
-            return "result"
+            return "result", 0
 
-        result = db._execute_with_retry(op, op_label="test")
+        result = db._execute_with_retry(op, op_label="test", sql_for_hash="SELECT 1")
 
         assert result == "result"
         assert len(calls) == 1
@@ -371,13 +371,13 @@ class TestExecuteWithRetry:
 
         calls: list[object] = []
 
-        def op(conn: object) -> str:
+        def op(conn: object) -> tuple[str, int]:
             calls.append(conn)
             if len(calls) == 1:
                 raise pyodbc.Error("IMC06", "connection broken")
-            return "recovered"
+            return "recovered", 0
 
-        result = db._execute_with_retry(op, op_label="test")
+        result = db._execute_with_retry(op, op_label="test", sql_for_hash="SELECT 1")
 
         assert result == "recovered"
         assert len(calls) == 2
@@ -397,12 +397,12 @@ class TestExecuteWithRetry:
 
         calls: list[object] = []
 
-        def op(conn: object) -> object:
+        def op(conn: object) -> tuple[object, int]:
             calls.append(conn)
             raise pyodbc.Error("42S02", "Invalid object name 'x'")
 
         with pytest.raises(FabricQueryError) as exc_info:
-            db._execute_with_retry(op, op_label="test")
+            db._execute_with_retry(op, op_label="test", sql_for_hash="SELECT 1")
 
         assert exc_info.value.sqlstate == "42S02"
         assert len(calls) == 1  # no retry
@@ -421,11 +421,11 @@ class TestExecuteWithRetry:
         db, _ = self._make_db()
         mock_connect.side_effect = [MagicMock(name="c1"), MagicMock(name="c2")]
 
-        def op(conn: object) -> object:
+        def op(conn: object) -> tuple[object, int]:
             raise pyodbc.Error("IMC06", "still broken")
 
         with pytest.raises(FabricQueryError) as exc_info:
-            db._execute_with_retry(op, op_label="test")
+            db._execute_with_retry(op, op_label="test", sql_for_hash="SELECT 1")
 
         assert exc_info.value.sqlstate == "IMC06"
         assert mock_connect.call_count == 2  # exactly one retry, no infinite loop
@@ -570,3 +570,197 @@ class TestStaleConnectionRecovery:
             "resiliency in the ODBC driver')"
         )
         assert "ConnectRetryInterval" in conn_string
+
+    @patch("src.database.pyodbc.connect")
+    def test_connection_string_enables_tcp_keepalive(
+        self, mock_connect: MagicMock
+    ) -> None:
+        """Reproduces .claude/bugfix/2026-05-23-fabric-08s01-mid-query-tcp-drop:
+        heavy Fabric-side compute (~20s) goes silent on the TCP wire;
+        without an explicit KeepAlive < the intermediary's idle-drop
+        threshold (observed ~20s), the connection is killed mid-query.
+        Default driver KeepAlive=30s is too late."""
+        db, _ = self._make_db()
+        cursor = MagicMock()
+        cursor.description = [("id", int, None, None, None, None, False)]
+        cursor.fetchall.return_value = []
+        mock_connect.return_value.cursor.return_value = cursor
+
+        db.execute_query("SELECT 1")
+
+        conn_string = mock_connect.call_args.args[0]
+        assert "KeepAlive=" in conn_string, (
+            "expected KeepAlive keyword to override the 30s default that "
+            "leaves long-running queries vulnerable to intermediary "
+            "TCP-idle drops"
+        )
+        assert "KeepAliveInterval=" in conn_string
+
+    @patch("src.database.pyodbc.connect")
+    def test_connection_string_carries_application_name(
+        self, mock_connect: MagicMock
+    ) -> None:
+        """Application Name surfaces in Fabric's
+        queryinsights.exec_requests_history.program_name so DBAs can
+        filter requests originating from this MCP server without
+        scraping container logs."""
+        db, _ = self._make_db()
+        cursor = MagicMock()
+        cursor.description = [("id", int, None, None, None, None, False)]
+        cursor.fetchall.return_value = []
+        mock_connect.return_value.cursor.return_value = cursor
+
+        db.execute_query("SELECT 1")
+
+        conn_string = mock_connect.call_args.args[0]
+        # Accept either short-form `APP=` or long-form `Application Name=`
+        assert ("APP=" in conn_string) or ("Application Name=" in conn_string), (
+            "expected an APP / Application Name keyword so failures can be "
+            "correlated to this MCP server in Fabric server-side telemetry"
+        )
+
+
+class TestObservability:
+    """Per-attempt observability fields the operator needs to diagnose
+    intermittent failures without cross-referencing wall-clock
+    timestamps. Required fields: query_duration_ms, attempt, sql_hash."""
+
+    def _make_db(self) -> tuple[FabricDatabase, MagicMock]:
+        mock_auth = MagicMock()
+        mock_auth.get_token.return_value = "test-access-token"
+        db = FabricDatabase(
+            server="test.datawarehouse.fabric.microsoft.com",
+            database="gold_warehouse",
+            auth=mock_auth,
+        )
+        return db, mock_auth
+
+    @patch("src.database.pyodbc.connect")
+    def test_success_log_carries_query_duration_ms(
+        self, mock_connect: MagicMock, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        import logging
+
+        db, _ = self._make_db()
+        cursor = MagicMock()
+        cursor.description = [("id", int, None, None, None, None, False)]
+        cursor.fetchall.return_value = [(1,)]
+        mock_connect.return_value.cursor.return_value = cursor
+
+        with caplog.at_level(logging.INFO, logger="fabric_mcp.database"):
+            db.execute_query("SELECT 1")
+
+        success_records = [
+            r for r in caplog.records if "executed" in r.getMessage().lower()
+        ]
+        assert success_records, "expected at least one success log record"
+        record = success_records[-1]
+        assert hasattr(record, "query_duration_ms"), (
+            "operator needs duration without reconstructing from timestamps"
+        )
+        assert isinstance(record.query_duration_ms, int)
+        assert record.query_duration_ms >= 0
+
+    @patch("src.database.pyodbc.connect")
+    def test_retry_log_carries_attempt_and_duration(
+        self, mock_connect: MagicMock, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The 'reconnecting and retrying' warning must show how long the
+        first attempt took before failing — that's the smoking gun for
+        the mid-query TCP-drop pattern."""
+        import logging
+
+        import pyodbc
+
+        db, _ = self._make_db()
+        broken = MagicMock(name="broken")
+        broken_cursor = MagicMock()
+        broken_cursor.execute.side_effect = pyodbc.Error("08S01", "Communication link failure")
+        broken.cursor.return_value = broken_cursor
+
+        good = MagicMock(name="good")
+        good_cursor = MagicMock()
+        good_cursor.description = [("id", int, None, None, None, None, False)]
+        good_cursor.fetchall.return_value = []
+        good.cursor.return_value = good_cursor
+
+        mock_connect.side_effect = [broken, good]
+
+        with caplog.at_level(logging.WARNING, logger="fabric_mcp.database"):
+            db.execute_query("SELECT * FROM big_table")
+
+        retry_records = [
+            r for r in caplog.records if "reconnecting" in r.getMessage().lower()
+        ]
+        assert retry_records, "expected a retry warning record"
+        record = retry_records[-1]
+        assert hasattr(record, "attempt"), "attempt field required"
+        assert record.attempt == 0, (
+            "retry warning fires when attempt 0 failed; field should reflect that"
+        )
+        assert hasattr(record, "query_duration_ms")
+        assert hasattr(record, "sql_hash")
+        assert isinstance(record.sql_hash, str)
+        assert len(record.sql_hash) == 16  # sha256 first 16 hex chars
+
+    @patch("src.database.pyodbc.connect")
+    def test_final_error_log_carries_attempt_duration_sql_hash(
+        self, mock_connect: MagicMock, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """When both attempts fail, the FabricQueryError surface needs
+        attempt=1, duration, and sql_hash so the failure is fully
+        characterised from a single log line."""
+        import logging
+
+        import pyodbc
+
+        from src.database import FabricQueryError
+
+        db, _ = self._make_db()
+        # First conn: raises on cursor.execute. Reconnect happens.
+        # Second conn: also raises — this is the 'mid-query TCP drop' loop.
+        first = MagicMock(name="first")
+        first_cursor = MagicMock()
+        first_cursor.execute.side_effect = pyodbc.Error("08S01", "Communication link failure")
+        first.cursor.return_value = first_cursor
+
+        second = MagicMock(name="second")
+        second_cursor = MagicMock()
+        second_cursor.execute.side_effect = pyodbc.Error("08S01", "Communication link failure")
+        second.cursor.return_value = second_cursor
+
+        mock_connect.side_effect = [first, second]
+
+        with (
+            caplog.at_level(logging.INFO, logger="fabric_mcp.database"),
+            pytest.raises(FabricQueryError),
+        ):
+            db.execute_query("SELECT * FROM big_table")
+
+        # The FabricQueryError raise path must emit a record that names
+        # the failure mode and carries diagnostic fields.
+        error_records = [
+            r for r in caplog.records if r.levelname in {"ERROR", "WARNING"}
+        ]
+        assert error_records, "expected an error/warning record on final failure"
+        # The LAST warning/error record is the one that announces the
+        # exhausted retry; check it carries the three required fields.
+        record = error_records[-1]
+        assert hasattr(record, "attempt")
+        assert record.attempt == 1, "second attempt is attempt=1"
+        assert hasattr(record, "query_duration_ms")
+        assert hasattr(record, "sql_hash")
+
+    def test_sql_hash_is_stable_and_short(self) -> None:
+        """Internal: hash function used in logs must be stable for the
+        same SQL and short enough for log readability."""
+        from src.database import _sql_hash
+
+        sql = "SELECT * FROM gold.vw_Sch1X_EntityUSD WHERE FiscalMonth = 4"
+        h1 = _sql_hash(sql)
+        h2 = _sql_hash(sql)
+        assert h1 == h2
+        assert isinstance(h1, str)
+        assert len(h1) == 16
+        # Hex characters only — readable, paste-able.
+        int(h1, 16)  # no exception → valid hex
