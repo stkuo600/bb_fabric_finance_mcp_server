@@ -6,13 +6,32 @@ import contextlib
 import logging
 import struct
 import threading
+from dataclasses import dataclass
 
 import pyodbc
 
 from src.auth import FabricAuth
-from src.models import ColumnInfo, ErrorResponse
+from src.models import ColumnInfo
 
 logger = logging.getLogger("fabric_mcp.database")
+
+
+@dataclass
+class FabricQueryError(Exception):
+    """Structured failure surfaced by ``FabricDatabase.execute_query`` /
+    ``execute_write``. Carries the same fields callers used to recover by
+    JSON-parsing the prior ``RuntimeError`` message, plus the originating
+    SQLSTATE for callers that want to dispatch on connection vs query-side
+    errors without re-classifying the underlying pyodbc.Error.
+    """
+
+    message: str
+    code: str = "QUERY_ERROR"
+    details: str | None = None
+    sqlstate: str | None = None
+
+    def __str__(self) -> str:  # pragma: no cover - debug aid only
+        return f"[{self.code}] {self.message}"
 
 # pyodbc connection attribute for passing access token
 _SQL_COPT_SS_ACCESS_TOKEN = 1256
@@ -154,7 +173,7 @@ class FabricDatabase:
         """Execute a read-only SQL query and return column metadata and rows.
 
         Returns (columns, rows) where rows are dicts keyed by column name.
-        Raises RuntimeError with ErrorResponse JSON on failure.
+        Raises FabricQueryError on failure (code, message, details, sqlstate).
         """
         with self._lock:
             for attempt in (0, 1):
@@ -190,18 +209,17 @@ class FabricDatabase:
                         self._discard_connection()
                         continue
                     message = str(e)
-                    error = ErrorResponse(
-                        code="QUERY_ERROR",
+                    raise FabricQueryError(
                         message=message,
                         details=_hint_for_fabric_error(message),
-                    )
-                    raise RuntimeError(error.model_dump_json()) from e
+                        sqlstate=e.args[0] if e.args and isinstance(e.args[0], str) else None,
+                    ) from e
             raise RuntimeError("unreachable")  # pragma: no cover
 
     def execute_write(self, sql: str) -> int:
         """Execute a write SQL statement (INSERT/UPDATE) and return affected row count.
 
-        Raises RuntimeError with ErrorResponse JSON on failure.
+        Raises FabricQueryError on failure (code, message, details, sqlstate).
         """
         with self._lock:
             for attempt in (0, 1):
@@ -225,10 +243,9 @@ class FabricDatabase:
                         self._discard_connection()
                         continue
                     message = str(e)
-                    error = ErrorResponse(
-                        code="QUERY_ERROR",
+                    raise FabricQueryError(
                         message=message,
                         details=_hint_for_fabric_error(message),
-                    )
-                    raise RuntimeError(error.model_dump_json()) from e
+                        sqlstate=e.args[0] if e.args and isinstance(e.args[0], str) else None,
+                    ) from e
             raise RuntimeError("unreachable")  # pragma: no cover

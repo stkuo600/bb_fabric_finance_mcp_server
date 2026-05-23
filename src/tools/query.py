@@ -9,7 +9,7 @@ import re
 from mcp.server.fastmcp import FastMCP
 
 from src.config import FabricSettings
-from src.database import FabricDatabase
+from src.database import FabricDatabase, FabricQueryError
 from src.models import ErrorResponse, QueryResult
 
 logger = logging.getLogger("fabric_mcp.tools.query")
@@ -95,9 +95,9 @@ def register_query_tools(mcp: FastMCP, db: FabricDatabase, config: FabricSetting
 
         try:
             columns, rows = db.execute_query(sql, timeout=30)
-        except RuntimeError as e:
-            logger.error("Query failed", extra={"tool": "fabric_execute_query", "error_code": "QUERY_ERROR"})
-            return str(e)
+        except FabricQueryError as e:
+            logger.error("Query failed", extra={"tool": "fabric_execute_query", "error_code": e.code})
+            return ErrorResponse(code=e.code, message=e.message, details=e.details).model_dump_json()
 
         truncated = len(rows) > effective_cap
         if truncated:

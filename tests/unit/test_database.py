@@ -74,41 +74,54 @@ class TestFabricDatabase:
         assert len(rows) == 0
 
     @patch("src.database.pyodbc.connect")
-    def test_execute_query_raises_on_pyodbc_error(self, mock_connect: MagicMock) -> None:
+    def test_execute_query_raises_fabric_query_error_with_typed_fields(
+        self, mock_connect: MagicMock
+    ) -> None:
+        """Typed exception carries structured payload — no JSON-string-in-message
+        hack. Replaces the prior RuntimeError(model_dump_json()) contract."""
         import pyodbc
 
-        db, _ = self._make_db()
-        mock_connect.return_value.cursor.return_value.execute.side_effect = pyodbc.Error("HY000", "Test error")
-
-        with pytest.raises(RuntimeError, match="QUERY_ERROR"):
-            db.execute_query("SELECT bad")
-
-    @patch("src.database.pyodbc.connect")
-    def test_query_error_without_known_fabric_pattern_has_no_hint(self, mock_connect: MagicMock) -> None:
-        """For non-matching errors, `details` stays None — no false hints."""
-        import json as _json
-
-        import pyodbc
+        from src.database import FabricQueryError
 
         db, _ = self._make_db()
         mock_connect.return_value.cursor.return_value.execute.side_effect = pyodbc.Error(
             "42S02", "Invalid object name 'foo'"
         )
 
-        try:
+        with pytest.raises(FabricQueryError) as exc_info:
             db.execute_query("SELECT * FROM foo")
-        except RuntimeError as e:
-            payload = _json.loads(str(e))
-            assert payload["code"] == "QUERY_ERROR"
-            assert payload["details"] is None
+
+        e = exc_info.value
+        assert e.code == "QUERY_ERROR"
+        assert "Invalid object name" in e.message
+        assert e.details is None  # 42S02 does not match any Fabric-hint pattern
+        assert e.sqlstate == "42S02"
+
+    @patch("src.database.pyodbc.connect")
+    def test_query_error_without_known_fabric_pattern_has_no_hint(self, mock_connect: MagicMock) -> None:
+        """For non-matching errors, `details` stays None — no false hints."""
+        import pyodbc
+
+        from src.database import FabricQueryError
+
+        db, _ = self._make_db()
+        mock_connect.return_value.cursor.return_value.execute.side_effect = pyodbc.Error(
+            "42S02", "Invalid object name 'foo'"
+        )
+
+        with pytest.raises(FabricQueryError) as exc_info:
+            db.execute_query("SELECT * FROM foo")
+        assert exc_info.value.code == "QUERY_ERROR"
+        assert exc_info.value.details is None
+        assert exc_info.value.sqlstate == "42S02"
 
     @patch("src.database.pyodbc.connect")
     def test_query_error_identity_overflow_carries_fabric_hint(self, mock_connect: MagicMock) -> None:
         """Fabric Warehouse cannot widen an existing INT IDENTITY column;
         the hint nudges the caller toward the recreate-with-BIGINT workaround."""
-        import json as _json
-
         import pyodbc
+
+        from src.database import FabricQueryError
 
         db, _ = self._make_db()
         mock_connect.return_value.cursor.return_value.execute.side_effect = pyodbc.Error(
@@ -116,21 +129,20 @@ class TestFabricDatabase:
             "Arithmetic overflow error converting IDENTITY to data type int.",
         )
 
-        try:
+        with pytest.raises(FabricQueryError) as exc_info:
             db.execute_query("SELECT 1")
-        except RuntimeError as e:
-            payload = _json.loads(str(e))
-            assert payload["code"] == "QUERY_ERROR"
-            assert payload["details"] is not None
-            assert "BIGINT" in payload["details"]
-            # Original error must be preserved in `message`
-            assert "Arithmetic overflow" in payload["message"]
+        e = exc_info.value
+        assert e.code == "QUERY_ERROR"
+        assert e.details is not None
+        assert "BIGINT" in e.details
+        # Original error must be preserved in `message`
+        assert "Arithmetic overflow" in e.message
 
     @patch("src.database.pyodbc.connect")
     def test_query_error_alter_table_add_column_carries_fabric_hint(self, mock_connect: MagicMock) -> None:
-        import json as _json
-
         import pyodbc
+
+        from src.database import FabricQueryError
 
         db, _ = self._make_db()
         mock_connect.return_value.cursor.return_value.execute.side_effect = pyodbc.Error(
@@ -138,20 +150,19 @@ class TestFabricDatabase:
             "ALTER TABLE ADD COLUMN is not supported on Fabric Warehouse.",
         )
 
-        try:
+        with pytest.raises(FabricQueryError) as exc_info:
             db.execute_query("SELECT 1")
-        except RuntimeError as e:
-            payload = _json.loads(str(e))
-            assert payload["details"] is not None
-            assert "recreate" in payload["details"].lower() or "DROP" in payload["details"]
-            assert "ALTER TABLE ADD COLUMN" in payload["message"]
+        e = exc_info.value
+        assert e.details is not None
+        assert "recreate" in e.details.lower() or "DROP" in e.details
+        assert "ALTER TABLE ADD COLUMN" in e.message
 
     @patch("src.database.pyodbc.connect")
     def test_write_error_propagates_fabric_hint(self, mock_connect: MagicMock) -> None:
         """The hint logic must apply to execute_write too, not just queries."""
-        import json as _json
-
         import pyodbc
+
+        from src.database import FabricQueryError
 
         db, _ = self._make_db()
         mock_connect.return_value.cursor.return_value.execute.side_effect = pyodbc.Error(
@@ -159,12 +170,11 @@ class TestFabricDatabase:
             "Arithmetic overflow error converting IDENTITY to data type int.",
         )
 
-        try:
+        with pytest.raises(FabricQueryError) as exc_info:
             db.execute_write("INSERT INTO t VALUES (1)")
-        except RuntimeError as e:
-            payload = _json.loads(str(e))
-            assert payload["details"] is not None
-            assert "BIGINT" in payload["details"]
+        e = exc_info.value
+        assert e.details is not None
+        assert "BIGINT" in e.details
 
     @patch("src.database.pyodbc.connect")
     def test_execute_write_returns_affected_count(self, mock_connect: MagicMock) -> None:
@@ -292,6 +302,8 @@ class TestConnectionReuse:
     def test_query_error_does_not_discard_connection(self, mock_connect: MagicMock) -> None:
         import pyodbc
 
+        from src.database import FabricQueryError
+
         db, _ = self._make_db()
 
         # Single connection that returns different cursors on successive calls.
@@ -304,7 +316,7 @@ class TestConnectionReuse:
 
         mock_connect.return_value.cursor.side_effect = [bad_cursor, good_cursor]
 
-        with pytest.raises(RuntimeError, match="QUERY_ERROR"):
+        with pytest.raises(FabricQueryError):
             db.execute_query("SELECT * FROM no_such_table")
 
         db.execute_query("SELECT 1")
@@ -493,6 +505,8 @@ class TestStaleConnectionRecovery:
         SQLSTATEs (42S02, 22003, etc.) must NOT trigger reconnect."""
         import pyodbc
 
+        from src.database import FabricQueryError
+
         db, _ = self._make_db()
         bad_cursor = MagicMock()
         bad_cursor.execute.side_effect = pyodbc.Error(
@@ -503,7 +517,7 @@ class TestStaleConnectionRecovery:
         good_cursor.fetchall.return_value = []
         mock_connect.return_value.cursor.side_effect = [bad_cursor, good_cursor]
 
-        with pytest.raises(RuntimeError, match="QUERY_ERROR"):
+        with pytest.raises(FabricQueryError):
             db.execute_query("SELECT * FROM no_such_table")
         db.execute_query("SELECT 1")
 

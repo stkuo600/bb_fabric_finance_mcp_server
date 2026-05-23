@@ -21,7 +21,7 @@ from datetime import UTC, datetime, timedelta
 from mcp.server.fastmcp import FastMCP
 
 from src.config import FabricSettings
-from src.database import FabricDatabase
+from src.database import FabricDatabase, FabricQueryError
 from src.models import ErrorResponse, WritePreview, WriteResult
 
 logger = logging.getLogger("fabric_mcp.tools.write")
@@ -191,19 +191,15 @@ def register_write_tools(mcp: FastMCP, db: FabricDatabase, config: FabricSetting
 
             try:
                 affected = db.execute_write(sql)
-            except RuntimeError as e:
-                # db.execute_write wraps pyodbc errors as ErrorResponse JSON.
-                # Parse it back so the per-token result is structured.
-                try:
-                    err_payload = json.loads(str(e))
-                except json.JSONDecodeError:
-                    err_payload = {"code": "QUERY_ERROR", "message": str(e), "details": None}
+            except FabricQueryError as e:
                 results.append(
                     {
                         "status": "error",
                         "operation": operation,
                         "table": table,
-                        **err_payload,
+                        "code": e.code,
+                        "message": e.message,
+                        "details": e.details,
                     }
                 )
                 failed += 1
@@ -322,12 +318,12 @@ def register_write_tools(mcp: FastMCP, db: FabricDatabase, config: FabricSetting
         )
         try:
             _, col_rows = db.execute_query(check_sql)
-        except RuntimeError as e:
+        except FabricQueryError as e:
             logger.error(
                 "Column check failed",
-                extra={"tool": "fabric_delete_period", "error_code": "QUERY_ERROR"},
+                extra={"tool": "fabric_delete_period", "error_code": e.code},
             )
-            return str(e)
+            return ErrorResponse(code=e.code, message=e.message, details=e.details).model_dump_json()
 
         found_lower = {str(row["COLUMN_NAME"]).lower() for row in col_rows}
         required = ("FiscalYear", "FiscalMonth")
@@ -352,12 +348,12 @@ def register_write_tools(mcp: FastMCP, db: FabricDatabase, config: FabricSetting
         )
         try:
             deleted_rows = db.execute_write(delete_sql)
-        except RuntimeError as e:
+        except FabricQueryError as e:
             logger.error(
                 "Delete failed",
-                extra={"tool": "fabric_delete_period", "error_code": "QUERY_ERROR"},
+                extra={"tool": "fabric_delete_period", "error_code": e.code},
             )
-            return str(e)
+            return ErrorResponse(code=e.code, message=e.message, details=e.details).model_dump_json()
 
         result = {
             "deleted_rows": deleted_rows,
@@ -510,12 +506,12 @@ def register_write_tools(mcp: FastMCP, db: FabricDatabase, config: FabricSetting
 
         try:
             affected_rows = db.execute_write(sql)
-        except RuntimeError as e:
+        except FabricQueryError as e:
             logger.error(
                 "Write execution failed",
-                extra={"tool": "fabric_execute_write", "error_code": "QUERY_ERROR"},
+                extra={"tool": "fabric_execute_write", "error_code": e.code},
             )
-            return str(e)
+            return ErrorResponse(code=e.code, message=e.message, details=e.details).model_dump_json()
 
         result = WriteResult(
             affected_rows=affected_rows,

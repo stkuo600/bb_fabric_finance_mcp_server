@@ -145,12 +145,17 @@ class TestFabricExecuteQuery:
         assert result["code"] == "INVALID_OPERATION"
 
     def test_query_error_returns_error_response(self) -> None:
+        from src.database import FabricQueryError
+
         fn, mock_db = _make_query_tool()
-        error_json = json.dumps({"code": "QUERY_ERROR", "message": "Syntax error", "details": None})
-        mock_db.execute_query.side_effect = RuntimeError(error_json)
+        mock_db.execute_query.side_effect = FabricQueryError(
+            message="Syntax error", code="QUERY_ERROR", details=None, sqlstate="42000"
+        )
 
         result = json.loads(fn("SELECT bad syntax"))
         assert result["code"] == "QUERY_ERROR"
+        assert result["message"] == "Syntax error"
+        assert result["details"] is None
 
 
 class TestCommonTableExpression:

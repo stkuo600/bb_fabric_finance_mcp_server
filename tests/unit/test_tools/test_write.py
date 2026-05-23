@@ -438,15 +438,21 @@ class TestFabricExecuteWriteBatch:
         preview_fn, _ = tools["fabric_preview_write"]
         batch_fn, mock_db = tools["fabric_execute_write_batch"]
 
-        # db.execute_write wraps pyodbc errors as ErrorResponse JSON; simulate
+        # db.execute_write raises FabricQueryError on pyodbc errors; simulate
         # that the first token's INSERT hits a constraint violation, while the
         # next two succeed.
-        err_json = json.dumps({
-            "code": "QUERY_ERROR",
-            "message": "Violation of PRIMARY KEY constraint",
-            "details": None,
-        })
-        mock_db.execute_write.side_effect = [RuntimeError(err_json), 1, 1]
+        from src.database import FabricQueryError
+
+        mock_db.execute_write.side_effect = [
+            FabricQueryError(
+                message="Violation of PRIMARY KEY constraint",
+                code="QUERY_ERROR",
+                details=None,
+                sqlstate="23000",
+            ),
+            1,
+            1,
+        ]
 
         tokens = self._make_tokens(
             preview_fn,
