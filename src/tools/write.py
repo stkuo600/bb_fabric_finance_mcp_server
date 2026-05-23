@@ -9,13 +9,9 @@ design rationale and the deliberate replay-within-window trade-off.
 
 from __future__ import annotations
 
-import base64
-import hashlib
-import hmac
 import json
 import logging
 import re
-import secrets
 from datetime import UTC, datetime, timedelta
 
 from mcp.server.fastmcp import FastMCP
@@ -23,6 +19,11 @@ from mcp.server.fastmcp import FastMCP
 from src.config import FabricSettings
 from src.database import FabricDatabase, FabricQueryError
 from src.models import WritePreview, WriteResult
+from src.tools._confirmation_token import (
+    ensure_token_not_expired,
+    make_confirmation_token,
+    parse_confirmation_token,
+)
 from src.tools._responses import ToolInputError, error_envelope
 from src.tools._validators import validate_int_range, validate_writable_table
 
@@ -31,8 +32,6 @@ logger = logging.getLogger("fabric_mcp.tools.write")
 _INSERT_PATTERN = re.compile(r"^\s*INSERT\s+INTO\s+(\S+)", re.IGNORECASE)
 _UPDATE_PATTERN = re.compile(r"^\s*UPDATE\s+(\S+)", re.IGNORECASE)
 
-_TOKEN_VERSION = 1
-_SIGNING_KEY_DOMAIN = b"fabric-mcp-write-confirmation\x00"
 _BATCH_MAX_TOKENS = 100
 
 
@@ -48,47 +47,6 @@ def _parse_write_sql(sql: str) -> tuple[str, str] | None:
     if match:
         return "UPDATE", match.group(1)
     return None
-
-
-def _signing_key(secret: str) -> bytes:
-    return hashlib.sha256(_SIGNING_KEY_DOMAIN + secret.encode("utf-8")).digest()
-
-
-def _b64u_encode(data: bytes) -> str:
-    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
-
-
-def _b64u_decode(data: str) -> bytes:
-    padding = "=" * (-len(data) % 4)
-    return base64.urlsafe_b64decode(data + padding)
-
-
-def _make_token(payload: dict[str, object], secret: str) -> str:
-    payload_bytes = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
-    payload_b64 = _b64u_encode(payload_bytes)
-    sig = hmac.new(_signing_key(secret), payload_b64.encode("ascii"), hashlib.sha256).digest()
-    return f"{payload_b64}.{_b64u_encode(sig)}"
-
-
-def _verify_token(token: str, secret: str) -> dict[str, object] | None:
-    """Verify signature and return the decoded payload, or None if invalid."""
-    if not isinstance(token, str) or token.count(".") != 1:
-        return None
-    payload_b64, sig_b64 = token.split(".", 1)
-    try:
-        sig = _b64u_decode(sig_b64)
-        expected = hmac.new(_signing_key(secret), payload_b64.encode("ascii"), hashlib.sha256).digest()
-    except (ValueError, TypeError):
-        return None
-    if not hmac.compare_digest(sig, expected):
-        return None
-    try:
-        payload = json.loads(_b64u_decode(payload_b64))
-    except (ValueError, TypeError, json.JSONDecodeError):
-        return None
-    if not isinstance(payload, dict) or payload.get("v") != _TOKEN_VERSION:
-        return None
-    return payload
 
 
 def register_write_tools(mcp: FastMCP, db: FabricDatabase, config: FabricSettings) -> None:
@@ -142,44 +100,37 @@ def register_write_tools(mcp: FastMCP, db: FabricDatabase, config: FabricSetting
         now_ts = datetime.now(tz=UTC).timestamp()
 
         for token in confirmation_tokens:
-            payload = _verify_token(token, config.client_secret)
-            if payload is None:
-                results.append(
-                    {
-                        "status": "error",
-                        "code": "TOKEN_INVALID",
-                        "message": "Confirmation token is missing, malformed, or has an invalid signature.",
-                    }
-                )
+            # Two try blocks: TOKEN_INVALID has no payload to surface,
+            # but TOKEN_EXPIRED / FabricQueryError must preserve op/table
+            # for the per-token UX.
+            try:
+                payload = parse_confirmation_token(token, config.client_secret)
+            except ToolInputError as e:
+                results.append({"status": "error", "code": e.code, "message": e.message})
                 failed += 1
                 continue
-
-            exp = payload.get("exp")
-            if not isinstance(exp, int | float) or exp < now_ts:
-                results.append(
-                    {
-                        "status": "error",
-                        "code": "TOKEN_EXPIRED",
-                        "message": "Confirmation token has expired. Please preview the write operation again.",
-                        "operation": str(payload.get("op", "")),
-                        "table": str(payload.get("table", "")),
-                    }
-                )
-                failed += 1
-                continue
-
-            sql = str(payload.get("sql", ""))
-            operation = str(payload.get("op", ""))
-            table = str(payload.get("table", ""))
 
             try:
-                affected = db.execute_write(sql)
+                ensure_token_not_expired(payload, now=now_ts)
+                affected = db.execute_write(payload.sql)
+            except ToolInputError as e:
+                results.append(
+                    {
+                        "status": "error",
+                        "code": e.code,
+                        "message": e.message,
+                        "operation": payload.op,
+                        "table": payload.table,
+                    }
+                )
+                failed += 1
+                continue
             except FabricQueryError as e:
                 results.append(
                     {
                         "status": "error",
-                        "operation": operation,
-                        "table": table,
+                        "operation": payload.op,
+                        "table": payload.table,
                         "code": e.code,
                         "message": e.message,
                         "details": e.details,
@@ -192,20 +143,20 @@ def register_write_tools(mcp: FastMCP, db: FabricDatabase, config: FabricSetting
                 {
                     "status": "ok",
                     "affected_rows": affected,
-                    "operation": operation,
-                    "table": table,
+                    "operation": payload.op,
+                    "table": payload.table,
                 }
             )
             succeeded += 1
             logger.info(
                 "Batch write executed: %s on %s, %d rows affected",
-                operation,
-                table,
+                payload.op,
+                payload.table,
                 affected,
                 extra={
                     "tool": "fabric_execute_write_batch",
-                    "operation": operation,
-                    "table": table,
+                    "operation": payload.op,
+                    "table": payload.table,
                     "row_count": affected,
                 },
             )
@@ -356,18 +307,13 @@ def register_write_tools(mcp: FastMCP, db: FabricDatabase, config: FabricSetting
         except ToolInputError as e:
             return error_envelope(e, tool="fabric_preview_write")
 
-        issued_at = datetime.now(tz=UTC)
-        expires_at = issued_at + timedelta(minutes=config.write_token_expiry_minutes)
-        payload = {
-            "v": _TOKEN_VERSION,
-            "sql": sql,
-            "op": operation,
-            "table": table,
-            "iat": issued_at.timestamp(),
-            "exp": expires_at.timestamp(),
-            "nonce": secrets.token_hex(16),
-        }
-        token = _make_token(payload, config.client_secret)
+        token, expires_at = make_confirmation_token(
+            sql=sql,
+            op=operation,
+            table=table,
+            secret=config.client_secret,
+            expires_in=timedelta(minutes=config.write_token_expiry_minutes),
+        )
 
         preview = WritePreview(
             confirmation_token=token,
@@ -400,31 +346,16 @@ def register_write_tools(mcp: FastMCP, db: FabricDatabase, config: FabricSetting
         )
 
         try:
-            payload = _verify_token(confirmation_token, config.client_secret)
-            if payload is None:
-                raise ToolInputError(
-                    code="TOKEN_INVALID",
-                    message="Confirmation token is missing, malformed, or has an invalid signature.",
-                )
-
-            exp = payload.get("exp")
-            if not isinstance(exp, int | float) or exp < datetime.now(tz=UTC).timestamp():
-                raise ToolInputError(
-                    code="TOKEN_EXPIRED",
-                    message="Confirmation token has expired. Please preview the write operation again.",
-                )
-
-            sql = str(payload.get("sql", ""))
-            operation = str(payload.get("op", ""))
-            table = str(payload.get("table", ""))
-            affected_rows = db.execute_write(sql)
+            payload = parse_confirmation_token(confirmation_token, config.client_secret)
+            ensure_token_not_expired(payload, now=datetime.now(tz=UTC).timestamp())
+            affected_rows = db.execute_write(payload.sql)
         except (ToolInputError, FabricQueryError) as e:
             return error_envelope(e, tool="fabric_execute_write")
 
         result = WriteResult(
             affected_rows=affected_rows,
-            operation=operation,
-            table=table,
+            operation=payload.op,
+            table=payload.table,
         )
         logger.info(
             "Write executed: %s on %s, %d rows affected",

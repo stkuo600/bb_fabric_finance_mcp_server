@@ -3,15 +3,12 @@
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime, timedelta
+from datetime import timedelta
 from unittest.mock import MagicMock
 
 from src.config import FabricSettings
-from src.tools.write import (
-    _TOKEN_VERSION,
-    _make_token,
-    _parse_write_sql,
-)
+from src.tools._confirmation_token import make_confirmation_token
+from src.tools.write import _parse_write_sql
 
 
 def _make_config(**overrides: object) -> FabricSettings:
@@ -149,17 +146,14 @@ class TestFabricExecuteWrite:
         tools = _make_write_tools(config=config)
         execute_fn, _ = tools["fabric_execute_write"]
 
-        # Forge a properly-signed token with an `exp` in the past.
-        expired_at = datetime.now(tz=UTC) - timedelta(minutes=1)
-        payload = {
-            "v": _TOKEN_VERSION,
-            "sql": "INSERT INTO gold.transactions (id) VALUES (1)",
-            "op": "INSERT",
-            "table": "gold.transactions",
-            "exp": expired_at.timestamp(),
-            "nonce": "0" * 32,
-        }
-        token = _make_token(payload, config.client_secret)
+        # Properly-signed token with `exp` already in the past.
+        token, _ = make_confirmation_token(
+            sql="INSERT INTO gold.transactions (id) VALUES (1)",
+            op="INSERT",
+            table="gold.transactions",
+            secret=config.client_secret,
+            expires_in=timedelta(minutes=-1),
+        )
 
         result = json.loads(execute_fn(token))
         assert result["code"] == "TOKEN_EXPIRED"
@@ -373,16 +367,13 @@ class TestFabricExecuteWriteBatch:
         tools = _make_write_tools(config=config)
         batch_fn, mock_db = tools["fabric_execute_write_batch"]
 
-        expired_payload = {
-            "v": _TOKEN_VERSION,
-            "sql": "INSERT INTO gold.transactions (id) VALUES (1)",
-            "op": "INSERT",
-            "table": "gold.transactions",
-            "iat": (datetime.now(tz=UTC) - timedelta(minutes=20)).timestamp(),
-            "exp": (datetime.now(tz=UTC) - timedelta(minutes=5)).timestamp(),
-            "nonce": "0" * 32,
-        }
-        expired_token = _make_token(expired_payload, config.client_secret)
+        expired_token, _ = make_confirmation_token(
+            sql="INSERT INTO gold.transactions (id) VALUES (1)",
+            op="INSERT",
+            table="gold.transactions",
+            secret=config.client_secret,
+            expires_in=timedelta(minutes=-5),
+        )
 
         result = json.loads(batch_fn([expired_token]))
 
