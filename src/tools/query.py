@@ -10,7 +10,9 @@ from mcp.server.fastmcp import FastMCP
 
 from src.config import FabricSettings
 from src.database import FabricDatabase, FabricQueryError
-from src.models import ErrorResponse, QueryResult
+from src.models import QueryResult
+from src.tools._responses import ToolInputError, error_envelope
+from src.tools._validators import validate_int_range
 
 logger = logging.getLogger("fabric_mcp.tools.query")
 
@@ -66,38 +68,23 @@ def register_query_tools(mcp: FastMCP, db: FabricDatabase, config: FabricSetting
         """
         logger.info("Query requested", extra={"tool": "fabric_execute_query"})
 
-        if not _is_read_only_query(sql):
-            error = ErrorResponse(
-                code="INVALID_OPERATION",
-                message=(
-                    "Only read-only queries are allowed: a SELECT, or a CTE-prefixed "
-                    "`WITH ... SELECT`. Use fabric_preview_write for INSERT/UPDATE."
-                ),
-            )
-            logger.warning(
-                "Non-read-only rejected",
-                extra={"tool": "fabric_execute_query", "error_code": "INVALID_OPERATION"},
-            )
-            return error.model_dump_json()
-
-        if max_rows is not None and not 1 <= max_rows <= 10000:
-            error = ErrorResponse(
-                code="INVALID_OPERATION",
-                message=f"max_rows must be between 1 and 10000; got {max_rows}.",
-            )
-            logger.warning(
-                "Invalid max_rows",
-                extra={"tool": "fabric_execute_query", "error_code": "INVALID_OPERATION"},
-            )
-            return error.model_dump_json()
-
-        effective_cap = max_rows if max_rows is not None else config.max_rows
-
         try:
+            if not _is_read_only_query(sql):
+                raise ToolInputError(
+                    code="INVALID_OPERATION",
+                    message=(
+                        "Only read-only queries are allowed: a SELECT, or a CTE-prefixed "
+                        "`WITH ... SELECT`. Use fabric_preview_write for INSERT/UPDATE."
+                    ),
+                )
+
+            if max_rows is not None:
+                validate_int_range(max_rows, name="max_rows", lo=1, hi=10000)
+
+            effective_cap = max_rows if max_rows is not None else config.max_rows
             columns, rows = db.execute_query(sql, timeout=30)
-        except FabricQueryError as e:
-            logger.error("Query failed", extra={"tool": "fabric_execute_query", "error_code": e.code})
-            return ErrorResponse(code=e.code, message=e.message, details=e.details).model_dump_json()
+        except (ToolInputError, FabricQueryError) as e:
+            return error_envelope(e, tool="fabric_execute_query")
 
         truncated = len(rows) > effective_cap
         if truncated:

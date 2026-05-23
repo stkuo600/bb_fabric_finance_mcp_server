@@ -22,7 +22,9 @@ from mcp.server.fastmcp import FastMCP
 
 from src.config import FabricSettings
 from src.database import FabricDatabase, FabricQueryError
-from src.models import ErrorResponse, WritePreview, WriteResult
+from src.models import WritePreview, WriteResult
+from src.tools._responses import ToolInputError, error_envelope
+from src.tools._validators import validate_int_range, validate_writable_table
 
 logger = logging.getLogger("fabric_mcp.tools.write")
 
@@ -46,17 +48,6 @@ def _parse_write_sql(sql: str) -> tuple[str, str] | None:
     if match:
         return "UPDATE", match.group(1)
     return None
-
-
-def _is_table_allowed(table: str, allowlist: list[str]) -> bool:
-    """Check if a table is on the write allowlist.
-
-    Supports both schema-qualified (gold.table) and unqualified (table) names.
-    """
-    if not allowlist:
-        return False
-    table_lower = table.lower().strip("[]\"")
-    return any(allowed.lower().strip("[]\"") == table_lower for allowed in allowlist)
 
 
 def _signing_key(secret: str) -> bytes:
@@ -129,23 +120,15 @@ def register_write_tools(mcp: FastMCP, db: FabricDatabase, config: FabricSetting
               "total_failed": <int>
             }
         """
-        if len(confirmation_tokens) > _BATCH_MAX_TOKENS:
-            error = ErrorResponse(
-                code="INVALID_OPERATION",
-                message=(
-                    f"Batch size {len(confirmation_tokens)} exceeds the limit of "
-                    f"{_BATCH_MAX_TOKENS} tokens."
-                ),
+        try:
+            validate_int_range(
+                len(confirmation_tokens),
+                name="batch size",
+                lo=0,
+                hi=_BATCH_MAX_TOKENS,
             )
-            logger.warning(
-                "Batch rejected: too many tokens",
-                extra={
-                    "tool": "fabric_execute_write_batch",
-                    "count": len(confirmation_tokens),
-                    "error_code": "INVALID_OPERATION",
-                },
-            )
-            return error.model_dump_json()
+        except ToolInputError as e:
+            return error_envelope(e, tool="fabric_execute_write_batch")
 
         logger.info(
             "Write batch requested: %d tokens",
@@ -275,85 +258,41 @@ def register_write_tools(mcp: FastMCP, db: FabricDatabase, config: FabricSetting
             },
         )
 
-        if not 1900 <= fiscal_year <= 9999:
-            error = ErrorResponse(
-                code="INVALID_OPERATION",
-                message=f"fiscal_year must be 1900-9999; got {fiscal_year}.",
-            )
-            return error.model_dump_json()
-
-        if not 1 <= fiscal_month <= 12:
-            error = ErrorResponse(
-                code="INVALID_OPERATION",
-                message=f"fiscal_month must be 1-12; got {fiscal_month}.",
-            )
-            return error.model_dump_json()
-
-        if "." not in table:
-            error = ErrorResponse(
-                code="INVALID_OPERATION",
-                message="table must be schema-qualified, e.g. 'raw.Fact_ExchangeRate'.",
-            )
-            return error.model_dump_json()
-
-        if not _is_table_allowed(table, config.write_allowlist):
-            allowed_str = ", ".join(config.write_allowlist) if config.write_allowlist else "(none)"
-            error = ErrorResponse(
-                code="TABLE_NOT_ALLOWED",
-                message=f"Table '{table}' is not on the write allowlist",
-                details=f"Allowed tables: {allowed_str}",
-            )
-            logger.warning(
-                "Table not allowed: %s",
+        try:
+            validate_int_range(fiscal_year, name="fiscal_year", lo=1900, hi=9999)
+            validate_int_range(fiscal_month, name="fiscal_month", lo=1, hi=12)
+            validate_writable_table(
                 table,
-                extra={"tool": "fabric_delete_period", "table": table, "error_code": "TABLE_NOT_ALLOWED"},
+                allowlist=config.write_allowlist,
+                require_qualified=True,
             )
-            return error.model_dump_json()
 
-        schema_name, table_name = table.split(".", 1)
-        check_sql = (
-            "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS "
-            f"WHERE TABLE_SCHEMA = '{schema_name}' AND TABLE_NAME = '{table_name}' "
-            "AND COLUMN_NAME IN ('FiscalYear', 'FiscalMonth')"
-        )
-        try:
+            schema_name, table_name = table.split(".", 1)
+            check_sql = (
+                "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS "
+                f"WHERE TABLE_SCHEMA = '{schema_name}' AND TABLE_NAME = '{table_name}' "
+                "AND COLUMN_NAME IN ('FiscalYear', 'FiscalMonth')"
+            )
             _, col_rows = db.execute_query(check_sql)
-        except FabricQueryError as e:
-            logger.error(
-                "Column check failed",
-                extra={"tool": "fabric_delete_period", "error_code": e.code},
-            )
-            return ErrorResponse(code=e.code, message=e.message, details=e.details).model_dump_json()
 
-        found_lower = {str(row["COLUMN_NAME"]).lower() for row in col_rows}
-        required = ("FiscalYear", "FiscalMonth")
-        missing = [c for c in required if c.lower() not in found_lower]
-        if missing:
-            error = ErrorResponse(
-                code="INVALID_OPERATION",
-                message=(
-                    f"Table '{table}' is missing required column(s) {missing}; "
-                    "fabric_delete_period only supports tables with both FiscalYear and FiscalMonth."
-                ),
-            )
-            logger.warning(
-                "Missing fiscal columns: %s",
-                missing,
-                extra={"tool": "fabric_delete_period", "table": table, "missing": missing},
-            )
-            return error.model_dump_json()
+            found_lower = {str(row["COLUMN_NAME"]).lower() for row in col_rows}
+            required = ("FiscalYear", "FiscalMonth")
+            missing = [c for c in required if c.lower() not in found_lower]
+            if missing:
+                raise ToolInputError(
+                    code="INVALID_OPERATION",
+                    message=(
+                        f"Table '{table}' is missing required column(s) {missing}; "
+                        "fabric_delete_period only supports tables with both FiscalYear and FiscalMonth."
+                    ),
+                )
 
-        delete_sql = (
-            f"DELETE FROM {table} WHERE FiscalYear = {fiscal_year} AND FiscalMonth = {fiscal_month}"
-        )
-        try:
+            delete_sql = (
+                f"DELETE FROM {table} WHERE FiscalYear = {fiscal_year} AND FiscalMonth = {fiscal_month}"
+            )
             deleted_rows = db.execute_write(delete_sql)
-        except FabricQueryError as e:
-            logger.error(
-                "Delete failed",
-                extra={"tool": "fabric_delete_period", "error_code": e.code},
-            )
-            return ErrorResponse(code=e.code, message=e.message, details=e.details).model_dump_json()
+        except (ToolInputError, FabricQueryError) as e:
+            return error_envelope(e, tool="fabric_delete_period")
 
         result = {
             "deleted_rows": deleted_rows,
@@ -405,33 +344,17 @@ def register_write_tools(mcp: FastMCP, db: FabricDatabase, config: FabricSetting
         """
         logger.info("Write preview requested", extra={"tool": "fabric_preview_write"})
 
-        parsed = _parse_write_sql(sql)
-        if parsed is None:
-            error = ErrorResponse(
-                code="INVALID_OPERATION",
-                message="Only INSERT and UPDATE statements are allowed.",
-            )
-            logger.warning(
-                "Non-write SQL rejected",
-                extra={"tool": "fabric_preview_write", "error_code": "INVALID_OPERATION"},
-            )
-            return error.model_dump_json()
-
-        operation, table = parsed
-
-        if not _is_table_allowed(table, config.write_allowlist):
-            allowed_str = ", ".join(config.write_allowlist) if config.write_allowlist else "(none)"
-            error = ErrorResponse(
-                code="TABLE_NOT_ALLOWED",
-                message=f"Table '{table}' is not on the write allowlist",
-                details=f"Allowed tables: {allowed_str}",
-            )
-            logger.warning(
-                "Table not allowed: %s",
-                table,
-                extra={"tool": "fabric_preview_write", "table": table, "error_code": "TABLE_NOT_ALLOWED"},
-            )
-            return error.model_dump_json()
+        try:
+            parsed = _parse_write_sql(sql)
+            if parsed is None:
+                raise ToolInputError(
+                    code="INVALID_OPERATION",
+                    message="Only INSERT and UPDATE statements are allowed.",
+                )
+            operation, table = parsed
+            validate_writable_table(table, allowlist=config.write_allowlist)
+        except ToolInputError as e:
+            return error_envelope(e, tool="fabric_preview_write")
 
         issued_at = datetime.now(tz=UTC)
         expires_at = issued_at + timedelta(minutes=config.write_token_expiry_minutes)
@@ -476,42 +399,27 @@ def register_write_tools(mcp: FastMCP, db: FabricDatabase, config: FabricSetting
             extra={"tool": "fabric_execute_write"},
         )
 
-        payload = _verify_token(confirmation_token, config.client_secret)
-        if payload is None:
-            error = ErrorResponse(
-                code="TOKEN_INVALID",
-                message="Confirmation token is missing, malformed, or has an invalid signature.",
-            )
-            logger.warning(
-                "Invalid token",
-                extra={"tool": "fabric_execute_write", "error_code": "TOKEN_INVALID"},
-            )
-            return error.model_dump_json()
-
-        exp = payload.get("exp")
-        if not isinstance(exp, int | float) or exp < datetime.now(tz=UTC).timestamp():
-            error = ErrorResponse(
-                code="TOKEN_EXPIRED",
-                message="Confirmation token has expired. Please preview the write operation again.",
-            )
-            logger.warning(
-                "Expired token",
-                extra={"tool": "fabric_execute_write", "error_code": "TOKEN_EXPIRED"},
-            )
-            return error.model_dump_json()
-
-        sql = str(payload.get("sql", ""))
-        operation = str(payload.get("op", ""))
-        table = str(payload.get("table", ""))
-
         try:
+            payload = _verify_token(confirmation_token, config.client_secret)
+            if payload is None:
+                raise ToolInputError(
+                    code="TOKEN_INVALID",
+                    message="Confirmation token is missing, malformed, or has an invalid signature.",
+                )
+
+            exp = payload.get("exp")
+            if not isinstance(exp, int | float) or exp < datetime.now(tz=UTC).timestamp():
+                raise ToolInputError(
+                    code="TOKEN_EXPIRED",
+                    message="Confirmation token has expired. Please preview the write operation again.",
+                )
+
+            sql = str(payload.get("sql", ""))
+            operation = str(payload.get("op", ""))
+            table = str(payload.get("table", ""))
             affected_rows = db.execute_write(sql)
-        except FabricQueryError as e:
-            logger.error(
-                "Write execution failed",
-                extra={"tool": "fabric_execute_write", "error_code": e.code},
-            )
-            return ErrorResponse(code=e.code, message=e.message, details=e.details).model_dump_json()
+        except (ToolInputError, FabricQueryError) as e:
+            return error_envelope(e, tool="fabric_execute_write")
 
         result = WriteResult(
             affected_rows=affected_rows,

@@ -9,7 +9,6 @@ from unittest.mock import MagicMock
 from src.config import FabricSettings
 from src.tools.write import (
     _TOKEN_VERSION,
-    _is_table_allowed,
     _make_token,
     _parse_write_sql,
 )
@@ -68,22 +67,6 @@ class TestParseWriteSql:
     def test_case_insensitive(self) -> None:
         result = _parse_write_sql("insert into gold.test (id) values (1)")
         assert result == ("INSERT", "gold.test")
-
-
-class TestIsTableAllowed:
-    """Test allowlist checking."""
-
-    def test_allowed_table(self) -> None:
-        assert _is_table_allowed("gold.transactions", ["gold.transactions"]) is True
-
-    def test_disallowed_table(self) -> None:
-        assert _is_table_allowed("raw.imports", ["gold.transactions"]) is False
-
-    def test_empty_allowlist(self) -> None:
-        assert _is_table_allowed("any_table", []) is False
-
-    def test_case_insensitive(self) -> None:
-        assert _is_table_allowed("Gold.Transactions", ["gold.transactions"]) is True
 
 
 class TestFabricPreviewWrite:

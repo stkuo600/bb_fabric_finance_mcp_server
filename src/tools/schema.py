@@ -8,7 +8,8 @@ import logging
 from mcp.server.fastmcp import FastMCP
 
 from src.database import FabricDatabase, FabricQueryError
-from src.models import ColumnInfo, ErrorResponse, SchemaInfo, TableInfo
+from src.models import ColumnInfo, SchemaInfo, TableInfo
+from src.tools._responses import ToolInputError, error_envelope
 
 logger = logging.getLogger("fabric_mcp.tools.schema")
 
@@ -43,8 +44,7 @@ def register_schema_tools(mcp: FastMCP, db: FabricDatabase) -> None:
         try:
             _, rows = db.execute_query(sql)
         except FabricQueryError as e:
-            logger.error("List schemas failed", extra={"tool": "fabric_list_schemas"})
-            return ErrorResponse(code=e.code, message=e.message, details=e.details).model_dump_json()
+            return error_envelope(e, tool="fabric_list_schemas")
 
         schemas = [
             SchemaInfo(schema_name=row["SCHEMA_NAME"]).model_dump()
@@ -78,8 +78,7 @@ def register_schema_tools(mcp: FastMCP, db: FabricDatabase) -> None:
         try:
             _, rows = db.execute_query(sql)
         except FabricQueryError as e:
-            logger.error("List tables failed", extra={"tool": "fabric_list_tables"})
-            return ErrorResponse(code=e.code, message=e.message, details=e.details).model_dump_json()
+            return error_envelope(e, tool="fabric_list_tables")
 
         tables = [
             TableInfo(
@@ -123,17 +122,13 @@ def register_schema_tools(mcp: FastMCP, db: FabricDatabase) -> None:
 
         try:
             _, rows = db.execute_query(sql)
-        except FabricQueryError as e:
-            logger.error("Describe table failed", extra={"tool": "fabric_describe_table"})
-            return ErrorResponse(code=e.code, message=e.message, details=e.details).model_dump_json()
-
-        if not rows:
-            error = ErrorResponse(
-                code="TABLE_NOT_FOUND",
-                message=f"Table '{table_name}' not found in the data warehouse",
-            )
-            logger.warning("Table not found: %s", table_name, extra={"tool": "fabric_describe_table"})
-            return error.model_dump_json()
+            if not rows:
+                raise ToolInputError(
+                    code="TABLE_NOT_FOUND",
+                    message=f"Table '{table_name}' not found in the data warehouse",
+                )
+        except (ToolInputError, FabricQueryError) as e:
+            return error_envelope(e, tool="fabric_describe_table")
 
         resolved_schema = rows[0]["TABLE_SCHEMA"]
         object_type = rows[0].get("TABLE_TYPE", "BASE TABLE")
