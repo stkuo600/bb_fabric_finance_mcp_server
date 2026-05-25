@@ -21,6 +21,16 @@ logger = logging.getLogger("fabric_mcp.database")
 
 _T = TypeVar("_T")
 
+# Per-fetch batch size handed to the ODBC driver via cursor.arraysize and the
+# corresponding cursor.fetchmany(N) loop in execute_query. Without this, pyodbc
+# fetches rows from the ODBC driver one at a time (SQLFetch per row), which
+# dominates wall time on Fabric round-trips. pyodbc's docs only document
+# arraysize as fetchmany's default size — fetchall() does NOT honor it — so the
+# loop is required, not optional, to realise the batching gain. 1000 is a
+# pragmatic ceiling: covers the per-call max_rows cap (10000) in ≤10 chunks
+# without bloating the driver's row buffer.
+_FETCH_BATCH_SIZE = 1000
+
 
 def _sql_hash(sql: str) -> str:
     """Stable 16-hex-char fingerprint of a SQL string for log correlation.
@@ -298,6 +308,7 @@ class FabricDatabase:
         ) -> tuple[tuple[list[ColumnInfo], list[dict[str, object]]], int]:
             conn.timeout = timeout
             cursor = conn.cursor()
+            cursor.arraysize = _FETCH_BATCH_SIZE
             cursor.execute(sql)
             columns = [
                 ColumnInfo(
@@ -308,7 +319,12 @@ class FabricDatabase:
                 for desc in cursor.description
             ]
             col_names = [c.name for c in columns]
-            rows = [dict(zip(col_names, row, strict=False)) for row in cursor.fetchall()]
+            rows: list[dict[str, object]] = []
+            while True:
+                chunk = cursor.fetchmany(_FETCH_BATCH_SIZE)
+                if not chunk:
+                    break
+                rows.extend(dict(zip(col_names, row, strict=False)) for row in chunk)
             return (columns, rows), len(rows)
 
         return self._execute_with_retry(op, op_label="query", sql_for_hash=sql)
@@ -325,3 +341,98 @@ class FabricDatabase:
             return affected, affected
 
         return self._execute_with_retry(op, op_label="write", sql_for_hash=sql)
+
+    def execute_writes(self, sqls: list[str]) -> list[int | FabricQueryError]:
+        """Execute a batch of write SQL statements under a single lock + cursor.
+
+        Returns a list aligned to ``sqls``: each slot is either the affected
+        row count (success) or a ``FabricQueryError`` (failure). Per-statement
+        errors do NOT abort the batch — later statements still execute.
+
+        Connection-class errors retain ``execute_write``'s recovery semantic:
+        the cached connection is discarded, a fresh one is opened, a fresh
+        cursor is built, and the failing statement is retried exactly once.
+        Subsequent statements continue on the recovered connection.
+
+        Why this exists instead of looping ``execute_write`` at the call site:
+        each ``execute_write`` re-acquires ``_lock``, re-runs the retry stack,
+        and allocates a new cursor (an ODBC SQLAllocHandle round-trip). On a
+        100-statement batch those fixed overheads dominate Fabric round-trip
+        time. This helper amortises them across the batch — one lock, one
+        cursor — while preserving per-statement error attribution.
+        """
+        if not sqls:
+            return []
+
+        results: list[int | FabricQueryError] = []
+        with self._lock:
+            conn = self._get_connection()
+            cursor = conn.cursor()
+            for idx, sql in enumerate(sqls):
+                sql_h = _sql_hash(sql)
+                for attempt in (0, 1):
+                    t0 = time.perf_counter()
+                    try:
+                        cursor.execute(sql)
+                        affected = cursor.rowcount
+                    except pyodbc.Error as e:
+                        duration_ms = int((time.perf_counter() - t0) * 1000)
+                        sqlstate = (
+                            e.args[0] if e.args and isinstance(e.args[0], str) else None
+                        )
+                        if attempt == 0 and _is_connection_error(e):
+                            logger.warning(
+                                "Batch write: connection-class error, reconnecting",
+                                extra={
+                                    "operation": "write_batch",
+                                    "sqlstate": sqlstate or "",
+                                    "attempt": attempt,
+                                    "query_duration_ms": duration_ms,
+                                    "sql_hash": sql_h,
+                                    "batch_index": idx,
+                                },
+                            )
+                            self._discard_connection()
+                            conn = self._get_connection()
+                            cursor = conn.cursor()
+                            continue
+                        logger.error(
+                            "Batch write failed at index %d after attempt %d",
+                            idx,
+                            attempt,
+                            extra={
+                                "operation": "write_batch",
+                                "sqlstate": sqlstate or "",
+                                "attempt": attempt,
+                                "query_duration_ms": duration_ms,
+                                "sql_hash": sql_h,
+                                "batch_index": idx,
+                            },
+                        )
+                        message = str(e)
+                        results.append(
+                            FabricQueryError(
+                                message=message,
+                                details=_hint_for_fabric_error(message),
+                                sqlstate=sqlstate,
+                            )
+                        )
+                        break
+                    else:
+                        duration_ms = int((time.perf_counter() - t0) * 1000)
+                        logger.info(
+                            "Batch write executed at index %d: %d rows",
+                            idx,
+                            affected,
+                            extra={
+                                "operation": "write_batch",
+                                "row_count": affected,
+                                "query_duration_ms": duration_ms,
+                                "sql_hash": sql_h,
+                                "attempt": attempt,
+                                "batch_index": idx,
+                            },
+                        )
+                        results.append(affected)
+                        break
+        return results

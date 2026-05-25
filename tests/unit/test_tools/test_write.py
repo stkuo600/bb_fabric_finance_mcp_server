@@ -114,6 +114,51 @@ class TestFabricPreviewWrite:
 
         assert result["code"] == "TABLE_NOT_ALLOWED"
 
+    def test_oversize_sql_rejected_up_front(self) -> None:
+        """Large SQL produces a confirmation token bigger than the transport
+        layer can carry, surfacing as an opaque TOKEN_INVALID on redemption.
+        Catch it at preview time with a structured INVALID_OPERATION naming
+        the actual size + ceiling so the caller knows to split into batches."""
+        from src.tools.write import _PREVIEW_SQL_MAX_BYTES
+
+        tools = _make_write_tools()
+        fn, _ = tools["fabric_preview_write"]
+
+        # A real-shaped INSERT … VALUES with enough tuples to exceed the cap.
+        prefix = "INSERT INTO gold.transactions (id, name) VALUES "
+        tuple_str = "(1, 'x'),"
+        n = (_PREVIEW_SQL_MAX_BYTES // len(tuple_str)) + 50
+        oversize = prefix + (tuple_str * n).rstrip(",")
+        assert len(oversize.encode("utf-8")) > _PREVIEW_SQL_MAX_BYTES
+
+        result = json.loads(fn(oversize))
+
+        assert result["code"] == "INVALID_OPERATION"
+        assert str(_PREVIEW_SQL_MAX_BYTES) in result["message"]
+        # Caller-actionable hint must name the workaround.
+        assert "split" in result["message"].lower() or "batch" in result["message"].lower()
+
+    def test_sql_at_exact_size_limit_accepted(self) -> None:
+        """Boundary: a SQL of exactly _PREVIEW_SQL_MAX_BYTES bytes is still
+        accepted — the rejection is strictly for sizes *above* the cap."""
+        from src.tools.write import _PREVIEW_SQL_MAX_BYTES
+
+        tools = _make_write_tools()
+        fn, _ = tools["fabric_preview_write"]
+
+        # Build a syntactically valid INSERT padded out with a long string
+        # literal so the encoded byte length lands exactly on the cap.
+        prefix = "INSERT INTO gold.transactions (id, name) VALUES (1, '"
+        suffix = "')"
+        pad = "x" * (_PREVIEW_SQL_MAX_BYTES - len(prefix) - len(suffix))
+        sql = prefix + pad + suffix
+        assert len(sql.encode("utf-8")) == _PREVIEW_SQL_MAX_BYTES
+
+        result = json.loads(fn(sql))
+        assert "confirmation_token" in result, (
+            f"SQL at exactly the byte cap must be accepted; got {result}"
+        )
+
 
 class TestFabricExecuteWrite:
     """Test the execute write tool."""
@@ -311,7 +356,7 @@ class TestFabricExecuteWriteBatch:
         tools = _make_write_tools()
         preview_fn, _ = tools["fabric_preview_write"]
         batch_fn, mock_db = tools["fabric_execute_write_batch"]
-        mock_db.execute_write.return_value = 1
+        mock_db.execute_writes.return_value = [1, 1, 1]
 
         tokens = self._make_tokens(
             preview_fn,
@@ -332,14 +377,19 @@ class TestFabricExecuteWriteBatch:
             assert r["affected_rows"] == 1
             assert r["operation"] == "INSERT"
             assert r["table"] == "gold.transactions"
-        assert mock_db.execute_write.call_count == 3
+        # All 3 statements must go through the single batched DB call —
+        # the per-statement `execute_write` path would re-acquire the
+        # connection lock per token and is what #2 was designed to avoid.
+        assert mock_db.execute_writes.call_count == 1
+        assert len(mock_db.execute_writes.call_args.args[0]) == 3
+        mock_db.execute_write.assert_not_called()
 
     def test_mixed_valid_and_invalid_tokens(self) -> None:
         """Best-effort: invalid token between valid ones must not abort the batch."""
         tools = _make_write_tools()
         preview_fn, _ = tools["fabric_preview_write"]
         batch_fn, mock_db = tools["fabric_execute_write_batch"]
-        mock_db.execute_write.return_value = 1
+        mock_db.execute_writes.return_value = [1, 1]
 
         valid_tokens = self._make_tokens(
             preview_fn,
@@ -359,8 +409,10 @@ class TestFabricExecuteWriteBatch:
         assert result["results"][1]["status"] == "error"
         assert result["results"][1]["code"] == "TOKEN_INVALID"
         assert result["results"][2]["status"] == "ok"
-        # Only the two valid tokens reached the database
-        assert mock_db.execute_write.call_count == 2
+        # Only the two valid tokens reached the DB, and they did so via a
+        # single batched call (one connection-lock acquire, one cursor).
+        assert mock_db.execute_writes.call_count == 1
+        assert len(mock_db.execute_writes.call_args.args[0]) == 2
 
     def test_expired_token_in_batch(self) -> None:
         config = _make_config()
@@ -381,6 +433,8 @@ class TestFabricExecuteWriteBatch:
         assert result["total_failed"] == 1
         assert result["results"][0]["status"] == "error"
         assert result["results"][0]["code"] == "TOKEN_EXPIRED"
+        # Pre-DB rejection must NOT touch the database batch path at all.
+        mock_db.execute_writes.assert_not_called()
         mock_db.execute_write.assert_not_called()
 
     def test_empty_token_list_is_no_op_success(self) -> None:
@@ -392,6 +446,7 @@ class TestFabricExecuteWriteBatch:
         assert result["results"] == []
         assert result["total_succeeded"] == 0
         assert result["total_failed"] == 0
+        mock_db.execute_writes.assert_not_called()
         mock_db.execute_write.assert_not_called()
 
     def test_batch_size_above_limit_rejected(self) -> None:
@@ -403,21 +458,21 @@ class TestFabricExecuteWriteBatch:
         result = json.loads(batch_fn(["fake"] * 101))
 
         assert result.get("code") == "INVALID_OPERATION"
+        mock_db.execute_writes.assert_not_called()
         mock_db.execute_write.assert_not_called()
 
     def test_database_error_in_one_token_does_not_abort_batch(self) -> None:
-        """If db.execute_write raises mid-batch, the failing token reports
-        QUERY_ERROR but later tokens still execute."""
+        """If a statement fails mid-batch, the failing token reports
+        QUERY_ERROR but later tokens still execute. `execute_writes` returns
+        per-statement outcomes positionally — a FabricQueryError in slot N
+        does NOT abort slot N+1."""
         tools = _make_write_tools()
         preview_fn, _ = tools["fabric_preview_write"]
         batch_fn, mock_db = tools["fabric_execute_write_batch"]
 
-        # db.execute_write raises FabricQueryError on pyodbc errors; simulate
-        # that the first token's INSERT hits a constraint violation, while the
-        # next two succeed.
         from src.database import FabricQueryError
 
-        mock_db.execute_write.side_effect = [
+        mock_db.execute_writes.return_value = [
             FabricQueryError(
                 message="Violation of PRIMARY KEY constraint",
                 code="QUERY_ERROR",
@@ -447,8 +502,9 @@ class TestFabricExecuteWriteBatch:
         assert result["results"][0]["table"] == "gold.transactions"
         assert result["results"][1]["status"] == "ok"
         assert result["results"][2]["status"] == "ok"
-        # All three were attempted
-        assert mock_db.execute_write.call_count == 3
+        # One batched DB call carrying all three statements.
+        assert mock_db.execute_writes.call_count == 1
+        assert len(mock_db.execute_writes.call_args.args[0]) == 3
 
 
 class TestFabricDeletePeriod:
@@ -571,3 +627,349 @@ class TestFabricDeletePeriod:
 
         result = json.loads(fn("raw.Fact_ExchangeRate", 2026, 5))
         assert result["deleted_rows"] == 0
+
+
+class TestFabricInsertSch1xRows:
+    """Structured bulk insert into raw.Fact_Sch1X. Bypasses the
+    LLM-emits-SQL bottleneck of the preview/execute pair by letting the
+    client send rows as data; server composes the multi-row INSERT and
+    runs it in one DB round-trip."""
+
+    def _make_row(self, **overrides: object) -> dict[str, object]:
+        base: dict[str, object] = {
+            "pl_mapping_key": 10,
+            "mtd_actual": 1.5,
+            "mtd_budget": 2.5,
+            "mtd_latest_estimate": 3.5,
+            "mtd_prior_year": 4.5,
+            "ytd_actual": 10.0,
+            "ytd_budget": 20.0,
+            "ytd_latest_estimate": 30.0,
+            "ytd_prior_year": 40.0,
+        }
+        base.update(overrides)
+        return base
+
+    def _tools_with_allowlist(self) -> tuple[callable, MagicMock]:
+        config = _make_config(write_allowlist=["raw.Fact_Sch1X"])
+        tools = _make_write_tools(config=config)
+        return tools["fabric_insert_sch1x_rows"]
+
+    def test_happy_path_returns_rows_inserted(self) -> None:
+        fn, mock_db = self._tools_with_allowlist()
+        mock_db.execute_write.return_value = 2
+
+        result = json.loads(
+            fn(
+                entity_key=7,
+                fiscal_year=2026,
+                fiscal_month=5,
+                version=1,
+                unit="1000",
+                rows=[
+                    self._make_row(pl_mapping_key=10),
+                    self._make_row(pl_mapping_key=11),
+                ],
+            )
+        )
+
+        assert result["rows_inserted"] == 2
+        assert result["entity_key"] == 7
+        assert result["fiscal_year"] == 2026
+        assert result["fiscal_month"] == 5
+        assert result["version"] == 1
+
+    def test_emitted_sql_has_expected_shape(self) -> None:
+        """The composed SQL must target raw.Fact_Sch1X, list columns in the
+        order the table expects, fill *_Pct as NULL, use GETDATE() for
+        LoadedAt, and apply EntityKey / Fiscal* / Version / Unit per row."""
+        fn, mock_db = self._tools_with_allowlist()
+        mock_db.execute_write.return_value = 1
+
+        fn(
+            entity_key=7,
+            fiscal_year=2026,
+            fiscal_month=5,
+            version=1,
+            unit="1000",
+            rows=[self._make_row(pl_mapping_key=10)],
+        )
+
+        sql = mock_db.execute_write.call_args[0][0]
+        # Target table.
+        assert "INSERT INTO raw.Fact_Sch1X" in sql
+        # Column order: identifying cols, MTD block, MTD_Pct block, YTD
+        # block, YTD_Pct block, LoadedAt. FactSch1XKey omitted.
+        assert "FactSch1XKey" not in sql
+        column_clause = sql.split("VALUES", 1)[0]
+        for col in (
+            "EntityKey", "PLMappingKey", "FiscalYear", "FiscalMonth",
+            "Version", "Unit",
+            "MTD_Actual", "MTD_Budget", "MTD_LatestEstimate", "MTD_PriorYear",
+            "MTD_Actual_Pct", "MTD_Budget_Pct", "MTD_LatestEst_Pct",
+            "MTD_PriorYear_Pct",
+            "YTD_Actual", "YTD_Budget", "YTD_LatestEstimate", "YTD_PriorYear",
+            "YTD_Actual_Pct", "YTD_Budget_Pct", "YTD_LatestEst_Pct",
+            "YTD_PriorYear_Pct",
+            "LoadedAt",
+        ):
+            assert col in column_clause, f"missing column {col} in INSERT list"
+        # Per-row VALUES tuple ends with NULL,NULL,NULL,NULL, GETDATE())
+        assert "NULL, NULL, NULL, NULL, GETDATE()" in sql
+
+    def test_emitted_sql_multi_row_values_for_each_row(self) -> None:
+        """Multiple rows → one INSERT with N VALUES tuples joined by `, `."""
+        fn, mock_db = self._tools_with_allowlist()
+        mock_db.execute_write.return_value = 3
+
+        fn(
+            entity_key=7, fiscal_year=2026, fiscal_month=5, version=1, unit="1000",
+            rows=[
+                self._make_row(pl_mapping_key=10),
+                self._make_row(pl_mapping_key=11),
+                self._make_row(pl_mapping_key=12),
+            ],
+        )
+
+        sql = mock_db.execute_write.call_args[0][0]
+        values_clause = sql.split("VALUES", 1)[1]
+        # GETDATE() appears exactly once per row tuple — robust way to count
+        # rows in the composed SQL without trying to disambiguate row-open
+        # parens from the GETDATE() call paren.
+        assert values_clause.count("GETDATE()") == 3
+        # PLMappingKey for each row must end up in order in the SQL.
+        for pl in (10, 11, 12):
+            assert f", {pl}, 2026, 5, 1, '1000'," in sql
+
+    def test_none_metric_becomes_sql_null(self) -> None:
+        fn, mock_db = self._tools_with_allowlist()
+        mock_db.execute_write.return_value = 1
+
+        fn(
+            entity_key=7, fiscal_year=2026, fiscal_month=5, version=1, unit="1000",
+            rows=[
+                self._make_row(
+                    pl_mapping_key=10,
+                    mtd_actual=None,
+                    ytd_prior_year=None,
+                ),
+            ],
+        )
+
+        sql = mock_db.execute_write.call_args[0][0]
+        values_clause = sql.split("VALUES", 1)[1]
+        # The NULL literal must appear among the MTD metric slots (positions
+        # 7..10 of the row tuple). Just verify NULL appears as a value rather
+        # than only as a *_Pct placeholder.
+        assert ", NULL," in values_clause
+
+    def test_integer_valued_float_drops_decimal_point(self) -> None:
+        """Per spec: 1000.0 → '1000', not '1000.0'."""
+        fn, mock_db = self._tools_with_allowlist()
+        mock_db.execute_write.return_value = 1
+
+        fn(
+            entity_key=7, fiscal_year=2026, fiscal_month=5, version=1, unit="1000",
+            rows=[self._make_row(pl_mapping_key=10, mtd_actual=1000.0)],
+        )
+
+        sql = mock_db.execute_write.call_args[0][0]
+        # Look for ' 1000,' (with space) — the metric slot — and confirm
+        # there is no '1000.0' anywhere.
+        assert ", 1000," in sql
+        assert "1000.0" not in sql
+
+    def test_non_integer_float_preserves_precision(self) -> None:
+        fn, mock_db = self._tools_with_allowlist()
+        mock_db.execute_write.return_value = 1
+
+        fn(
+            entity_key=7, fiscal_year=2026, fiscal_month=5, version=1, unit="1000",
+            rows=[self._make_row(pl_mapping_key=10, mtd_actual=1234.56)],
+        )
+
+        sql = mock_db.execute_write.call_args[0][0]
+        assert "1234.56" in sql
+
+    def test_unit_with_single_quote_is_escaped(self) -> None:
+        """Defence in depth — unit comes from the LLM; a stray single quote
+        must be doubled, not break out of the literal."""
+        fn, mock_db = self._tools_with_allowlist()
+        mock_db.execute_write.return_value = 1
+
+        fn(
+            entity_key=7, fiscal_year=2026, fiscal_month=5, version=1,
+            unit="1'00",
+            rows=[self._make_row(pl_mapping_key=10)],
+        )
+
+        sql = mock_db.execute_write.call_args[0][0]
+        assert "'1''00'" in sql
+        # Crucially, no unescaped single-quote-then-comma sequence that
+        # would close the literal mid-row.
+        assert "'1'00'" not in sql
+
+    def test_empty_rows_rejected(self) -> None:
+        fn, mock_db = self._tools_with_allowlist()
+
+        result = json.loads(
+            fn(
+                entity_key=7, fiscal_year=2026, fiscal_month=5, version=1,
+                unit="1000", rows=[],
+            )
+        )
+
+        assert result["code"] == "INVALID_OPERATION"
+        assert "non-empty" in result["message"].lower()
+        mock_db.execute_write.assert_not_called()
+
+    def test_table_not_on_allowlist_rejected(self) -> None:
+        """If raw.Fact_Sch1X is not in the allowlist, the tool refuses
+        even though the table is hard-coded — operator stays in control."""
+        config = _make_config(write_allowlist=["something.else"])
+        tools = _make_write_tools(config=config)
+        fn, mock_db = tools["fabric_insert_sch1x_rows"]
+
+        result = json.loads(
+            fn(
+                entity_key=7, fiscal_year=2026, fiscal_month=5, version=1,
+                unit="1000", rows=[self._make_row()],
+            )
+        )
+
+        assert result["code"] == "TABLE_NOT_ALLOWED"
+        mock_db.execute_write.assert_not_called()
+
+    def test_invalid_fiscal_month_rejected(self) -> None:
+        fn, mock_db = self._tools_with_allowlist()
+
+        for bad in (0, 13, -1):
+            result = json.loads(
+                fn(
+                    entity_key=7, fiscal_year=2026, fiscal_month=bad, version=1,
+                    unit="1000", rows=[self._make_row()],
+                )
+            )
+            assert result["code"] == "INVALID_OPERATION", f"month={bad}"
+        mock_db.execute_write.assert_not_called()
+
+    def test_invalid_fiscal_year_rejected(self) -> None:
+        fn, mock_db = self._tools_with_allowlist()
+
+        for bad in (1899, 0, 10000):
+            result = json.loads(
+                fn(
+                    entity_key=7, fiscal_year=bad, fiscal_month=5, version=1,
+                    unit="1000", rows=[self._make_row()],
+                )
+            )
+            assert result["code"] == "INVALID_OPERATION", f"year={bad}"
+        mock_db.execute_write.assert_not_called()
+
+    def test_missing_pl_mapping_key_names_row_index(self) -> None:
+        """Error message must identify which row failed so the LLM can fix
+        the right entry, not the whole batch."""
+        fn, mock_db = self._tools_with_allowlist()
+
+        rows = [
+            self._make_row(pl_mapping_key=10),
+            self._make_row(),  # remove pl_mapping_key next
+            self._make_row(pl_mapping_key=12),
+        ]
+        del rows[1]["pl_mapping_key"]
+
+        result = json.loads(
+            fn(
+                entity_key=7, fiscal_year=2026, fiscal_month=5, version=1,
+                unit="1000", rows=rows,
+            )
+        )
+
+        assert result["code"] == "INVALID_OPERATION"
+        assert "rows[1]" in result["message"]
+        assert "pl_mapping_key" in result["message"]
+        mock_db.execute_write.assert_not_called()
+
+    def test_bool_metric_rejected(self) -> None:
+        """bool is a Python int subclass; silently coercing True→1 in a
+        finance metric would mask an LLM-side type error."""
+        fn, mock_db = self._tools_with_allowlist()
+
+        result = json.loads(
+            fn(
+                entity_key=7, fiscal_year=2026, fiscal_month=5, version=1,
+                unit="1000",
+                rows=[self._make_row(pl_mapping_key=10, mtd_actual=True)],
+            )
+        )
+
+        assert result["code"] == "INVALID_OPERATION"
+        assert "rows[0].mtd_actual" in result["message"]
+        mock_db.execute_write.assert_not_called()
+
+    def test_nan_metric_rejected(self) -> None:
+        fn, mock_db = self._tools_with_allowlist()
+
+        result = json.loads(
+            fn(
+                entity_key=7, fiscal_year=2026, fiscal_month=5, version=1,
+                unit="1000",
+                rows=[
+                    self._make_row(pl_mapping_key=10, mtd_actual=float("nan"))
+                ],
+            )
+        )
+
+        assert result["code"] == "INVALID_OPERATION"
+        assert "rows[0].mtd_actual" in result["message"]
+        mock_db.execute_write.assert_not_called()
+
+    def test_missing_metric_field_treated_as_null(self) -> None:
+        """If the LLM omits a metric key entirely, treat it as NULL rather
+        than rejecting — keeps the row payload compact when many metrics
+        are unknown."""
+        fn, mock_db = self._tools_with_allowlist()
+        mock_db.execute_write.return_value = 1
+
+        partial = {
+            "pl_mapping_key": 10,
+            "mtd_actual": 1.5,
+            # mtd_budget omitted intentionally
+            "mtd_latest_estimate": 3.5,
+            "mtd_prior_year": 4.5,
+            "ytd_actual": 10.0,
+            "ytd_budget": 20.0,
+            "ytd_latest_estimate": 30.0,
+            "ytd_prior_year": 40.0,
+        }
+        result = json.loads(
+            fn(
+                entity_key=7, fiscal_year=2026, fiscal_month=5, version=1,
+                unit="1000", rows=[partial],
+            )
+        )
+        assert result["rows_inserted"] == 1
+        sql = mock_db.execute_write.call_args[0][0]
+        # 1.5 (mtd_actual), NULL (mtd_budget omitted), 3.5 (mtd_latest_estimate)
+        assert "1.5, NULL, 3.5" in sql
+
+    def test_db_error_surfaces_as_query_error_envelope(self) -> None:
+        from src.database import FabricQueryError
+
+        fn, mock_db = self._tools_with_allowlist()
+        mock_db.execute_write.side_effect = FabricQueryError(
+            message="Violation of PRIMARY KEY constraint",
+            code="QUERY_ERROR",
+            details=None,
+            sqlstate="23000",
+        )
+
+        result = json.loads(
+            fn(
+                entity_key=7, fiscal_year=2026, fiscal_month=5, version=1,
+                unit="1000", rows=[self._make_row()],
+            )
+        )
+
+        assert result["code"] == "QUERY_ERROR"
+        assert "PRIMARY KEY" in result["message"]

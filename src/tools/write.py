@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 from datetime import UTC, datetime, timedelta
 
@@ -33,6 +34,109 @@ _INSERT_PATTERN = re.compile(r"^\s*INSERT\s+INTO\s+(\S+)", re.IGNORECASE)
 _UPDATE_PATTERN = re.compile(r"^\s*UPDATE\s+(\S+)", re.IGNORECASE)
 
 _BATCH_MAX_TOKENS = 100
+
+# Upper bound on SQL byte length accepted by fabric_preview_write. The SQL is
+# embedded in the confirmation token (JSON payload + base64 + HMAC sig), so the
+# emitted token is roughly 1.4× this size. 60 KB gives ~80 KB tokens, which
+# clears the largest transport / proxy size limits we have observed without
+# being annoyingly tight for normal multi-row INSERTs. Hitting this returns a
+# structured INVALID_OPERATION up-front so the caller does not have to discover
+# the limit by suffering an opaque TOKEN_INVALID on the redemption call.
+_PREVIEW_SQL_MAX_BYTES = 60_000
+
+# Fixed target table for the bulk Sch1X insert tool. Hard-coded (rather than
+# parameterised) because the tool's whole point is to keep the LLM-side payload
+# small — letting the LLM choose the table would require it to also generate
+# the column list, undoing the gain.
+_SCH1X_TABLE = "raw.Fact_Sch1X"
+
+# Per-row metric fields, in the order matching the target table's MTD_* then
+# YTD_* columns. The corresponding _Pct columns are emitted as NULL in the
+# composed SQL — they are not user-supplied via this tool.
+_SCH1X_METRIC_FIELDS = (
+    "mtd_actual",
+    "mtd_budget",
+    "mtd_latest_estimate",
+    "mtd_prior_year",
+    "ytd_actual",
+    "ytd_budget",
+    "ytd_latest_estimate",
+    "ytd_prior_year",
+)
+
+# Full target column list in INSERT order. FactSch1XKey is IDENTITY and is
+# omitted so Fabric generates it. LoadedAt receives GETDATE() in every row.
+# The eight *_Pct columns are reserved for downstream computation and are
+# written as NULL by this tool.
+_SCH1X_INSERT_COLUMNS = (
+    "EntityKey",
+    "PLMappingKey",
+    "FiscalYear",
+    "FiscalMonth",
+    "Version",
+    "Unit",
+    "MTD_Actual",
+    "MTD_Budget",
+    "MTD_LatestEstimate",
+    "MTD_PriorYear",
+    "MTD_Actual_Pct",
+    "MTD_Budget_Pct",
+    "MTD_LatestEst_Pct",
+    "MTD_PriorYear_Pct",
+    "YTD_Actual",
+    "YTD_Budget",
+    "YTD_LatestEstimate",
+    "YTD_PriorYear",
+    "YTD_Actual_Pct",
+    "YTD_Budget_Pct",
+    "YTD_LatestEst_Pct",
+    "YTD_PriorYear_Pct",
+    "LoadedAt",
+)
+
+
+def _fmt_sql_number(v: object) -> str:
+    """Render a numeric value as an inline SQL literal.
+
+    Rules:
+      * ``None`` → ``NULL``.
+      * ``int`` → decimal string (``42`` → ``"42"``).
+      * ``float`` whose value is an integer → emitted without the trailing
+        ``.0`` (``1000.0`` → ``"1000"``) per spec.
+      * ``float`` with a fractional part → ``repr(v)``, which for normal
+        finance-sized numbers stays in plain decimal notation (no scientific).
+      * Other types raise ``ValueError``. ``bool`` is rejected explicitly
+        even though it is an ``int`` subclass — silently coercing ``True``
+        to ``1`` for a metric column would mask an LLM-side type bug.
+      * NaN / ±inf raise ``ValueError`` since SQL Server has no literal for
+        them and the resulting cast error would be opaque to the caller.
+    """
+    if v is None:
+        return "NULL"
+    if isinstance(v, bool):
+        msg = f"boolean is not a valid numeric value: {v!r}"
+        raise ValueError(msg)
+    if isinstance(v, int):
+        return str(v)
+    if isinstance(v, float):
+        if math.isnan(v) or math.isinf(v):
+            msg = f"non-finite float is not allowed: {v!r}"
+            raise ValueError(msg)
+        if v == int(v):
+            return str(int(v))
+        return repr(v)
+    msg = f"unsupported numeric type {type(v).__name__}: {v!r}"
+    raise ValueError(msg)
+
+
+def _escape_sql_string(s: str) -> str:
+    """Escape a string for use as a single-quoted SQL Server literal.
+
+    Doubles embedded single quotes (the only T-SQL escape needed inside
+    ``'...'``). The caller is responsible for wrapping the result in
+    single quotes.
+    """
+    return s.replace("'", "''")
 
 
 def _parse_write_sql(sql: str) -> tuple[str, str] | None:
@@ -94,72 +198,71 @@ def register_write_tools(mcp: FastMCP, db: FabricDatabase, config: FabricSetting
             extra={"tool": "fabric_execute_write_batch", "count": len(confirmation_tokens)},
         )
 
-        results: list[dict[str, object]] = []
-        succeeded = 0
-        failed = 0
+        # Two-phase: HMAC verification + expiry check is CPU-bound and
+        # independent per-token, so it runs lock-free. Only the DB-bound
+        # statements that actually need execution are passed to
+        # `execute_writes`, which acquires the connection lock once and
+        # reuses a single cursor — amortising lock / cursor / retry-stack
+        # overhead across the batch.
+        results: list[dict[str, object] | None] = [None] * len(confirmation_tokens)
+        pending: list[tuple[int, object]] = []  # (original_index, payload)
         now_ts = datetime.now(tz=UTC).timestamp()
 
-        for token in confirmation_tokens:
-            # Two try blocks: TOKEN_INVALID has no payload to surface,
-            # but TOKEN_EXPIRED / FabricQueryError must preserve op/table
-            # for the per-token UX.
+        for i, token in enumerate(confirmation_tokens):
             try:
                 payload = parse_confirmation_token(token, config.client_secret)
             except ToolInputError as e:
-                results.append({"status": "error", "code": e.code, "message": e.message})
-                failed += 1
+                results[i] = {"status": "error", "code": e.code, "message": e.message}
                 continue
 
             try:
                 ensure_token_not_expired(payload, now=now_ts)
-                affected = db.execute_write(payload.sql)
             except ToolInputError as e:
-                results.append(
-                    {
-                        "status": "error",
-                        "code": e.code,
-                        "message": e.message,
-                        "operation": payload.op,
-                        "table": payload.table,
-                    }
-                )
-                failed += 1
-                continue
-            except FabricQueryError as e:
-                results.append(
-                    {
-                        "status": "error",
-                        "operation": payload.op,
-                        "table": payload.table,
-                        "code": e.code,
-                        "message": e.message,
-                        "details": e.details,
-                    }
-                )
-                failed += 1
-                continue
-
-            results.append(
-                {
-                    "status": "ok",
-                    "affected_rows": affected,
+                results[i] = {
+                    "status": "error",
+                    "code": e.code,
+                    "message": e.message,
                     "operation": payload.op,
                     "table": payload.table,
                 }
-            )
-            succeeded += 1
-            logger.info(
-                "Batch write executed: %s on %s, %d rows affected",
-                payload.op,
-                payload.table,
-                affected,
-                extra={
-                    "tool": "fabric_execute_write_batch",
-                    "operation": payload.op,
-                    "table": payload.table,
-                    "row_count": affected,
-                },
-            )
+                continue
+
+            pending.append((i, payload))
+
+        if pending:
+            outcomes = db.execute_writes([p.sql for _, p in pending])
+            for (i, payload), outcome in zip(pending, outcomes, strict=True):
+                if isinstance(outcome, FabricQueryError):
+                    results[i] = {
+                        "status": "error",
+                        "operation": payload.op,
+                        "table": payload.table,
+                        "code": outcome.code,
+                        "message": outcome.message,
+                        "details": outcome.details,
+                    }
+                else:
+                    results[i] = {
+                        "status": "ok",
+                        "affected_rows": outcome,
+                        "operation": payload.op,
+                        "table": payload.table,
+                    }
+                    logger.info(
+                        "Batch write executed: %s on %s, %d rows affected",
+                        payload.op,
+                        payload.table,
+                        outcome,
+                        extra={
+                            "tool": "fabric_execute_write_batch",
+                            "operation": payload.op,
+                            "table": payload.table,
+                            "row_count": outcome,
+                        },
+                    )
+
+        succeeded = sum(1 for r in results if r is not None and r.get("status") == "ok")
+        failed = sum(1 for r in results if r is not None and r.get("status") == "error")
 
         logger.info(
             "Write batch completed: %d succeeded, %d failed",
@@ -304,6 +407,18 @@ def register_write_tools(mcp: FastMCP, db: FabricDatabase, config: FabricSetting
                 )
             operation, table = parsed
             validate_writable_table(table, allowlist=config.write_allowlist)
+            sql_bytes = len(sql.encode("utf-8"))
+            if sql_bytes > _PREVIEW_SQL_MAX_BYTES:
+                raise ToolInputError(
+                    code="INVALID_OPERATION",
+                    message=(
+                        f"SQL is too large ({sql_bytes} bytes; max "
+                        f"{_PREVIEW_SQL_MAX_BYTES}). The SQL is embedded in the "
+                        "confirmation token, so an oversize SQL produces a token "
+                        "the transport layer may reject as TOKEN_INVALID. Split "
+                        "the statement into smaller batches and retry."
+                    ),
+                )
         except ToolInputError as e:
             return error_envelope(e, tool="fabric_preview_write")
 
@@ -370,3 +485,155 @@ def register_write_tools(mcp: FastMCP, db: FabricDatabase, config: FabricSetting
             },
         )
         return result.model_dump_json()
+
+    @mcp.tool()
+    def fabric_insert_sch1x_rows(
+        entity_key: int,
+        fiscal_year: int,
+        fiscal_month: int,
+        version: int,
+        unit: str,
+        rows: list[dict],
+    ) -> str:
+        """Bulk-insert structured rows into raw.Fact_Sch1X without a SQL string.
+
+        PREFERRED for bulk INSERT into raw.Fact_Sch1X. Accepts structured row
+        data; the server composes the multi-row INSERT and executes it in a
+        single round-trip. Avoids the slow path of fabric_preview_write +
+        fabric_execute_write, where the LLM has to emit the multi-row VALUES
+        SQL text token-by-token (the dominant wall-time cost for batches
+        above a handful of rows).
+
+        The target table and column list are fixed: EntityKey / FiscalYear /
+        FiscalMonth / Version / Unit identify the slice and apply to every
+        row; PLMappingKey and the eight MTD_* / YTD_* metric values come
+        from each entry in `rows`. The eight *_Pct columns are written as
+        NULL (this tool does not compute them). LoadedAt is set to
+        GETDATE(). FactSch1XKey is IDENTITY and is generated by Fabric.
+
+        Args:
+            entity_key: EntityKey applied to every inserted row.
+            fiscal_year: FiscalYear (1900-9999).
+            fiscal_month: FiscalMonth (1-12).
+            version: Version applied to every row.
+            unit: Unit string applied to every row (e.g. "1000").
+            rows: Non-empty list of dicts. Each dict must contain
+                ``pl_mapping_key`` (int) plus the eight metric values
+                ``mtd_actual`` / ``mtd_budget`` / ``mtd_latest_estimate`` /
+                ``mtd_prior_year`` / ``ytd_actual`` / ``ytd_budget`` /
+                ``ytd_latest_estimate`` / ``ytd_prior_year`` (float or
+                None). Missing metric keys are treated as None (NULL).
+
+        Returns:
+            On success, JSON: ``{rows_inserted, entity_key, fiscal_year,
+            fiscal_month, version}``. On rejection or DB failure: structured
+            ``INVALID_OPERATION`` / ``TABLE_NOT_ALLOWED`` / ``QUERY_ERROR``
+            envelope identifying the offending row index where applicable.
+        """
+        logger.info(
+            "Sch1X bulk insert requested",
+            extra={
+                "tool": "fabric_insert_sch1x_rows",
+                "entity_key": entity_key,
+                "fiscal_year": fiscal_year,
+                "fiscal_month": fiscal_month,
+                "version": version,
+                "row_count": len(rows),
+            },
+        )
+
+        try:
+            if not rows:
+                raise ToolInputError(
+                    code="INVALID_OPERATION",
+                    message="rows must be non-empty; no statement was executed.",
+                )
+
+            # The hard-coded target table must still be on the operator-
+            # controlled allowlist; this keeps a single env-var the way to
+            # gate any write tool, including this one.
+            validate_writable_table(_SCH1X_TABLE, allowlist=config.write_allowlist)
+            validate_int_range(fiscal_year, name="fiscal_year", lo=1900, hi=9999)
+            validate_int_range(fiscal_month, name="fiscal_month", lo=1, hi=12)
+
+            unit_lit = f"'{_escape_sql_string(unit)}'"
+            ek_lit = str(int(entity_key))
+            fy_lit = str(int(fiscal_year))
+            fm_lit = str(int(fiscal_month))
+            ver_lit = str(int(version))
+
+            values_rows: list[str] = []
+            for i, row in enumerate(rows):
+                pl_raw = row.get("pl_mapping_key")
+                if pl_raw is None or isinstance(pl_raw, bool):
+                    raise ToolInputError(
+                        code="INVALID_OPERATION",
+                        message=(
+                            f"rows[{i}].pl_mapping_key is missing or invalid: "
+                            f"{pl_raw!r}"
+                        ),
+                    )
+                try:
+                    pl_key = int(pl_raw)
+                except (TypeError, ValueError) as e:
+                    raise ToolInputError(
+                        code="INVALID_OPERATION",
+                        message=(
+                            f"rows[{i}].pl_mapping_key is not an int: {pl_raw!r}"
+                        ),
+                    ) from e
+
+                metric_literals: list[str] = []
+                for field in _SCH1X_METRIC_FIELDS:
+                    try:
+                        metric_literals.append(_fmt_sql_number(row.get(field)))
+                    except ValueError as ve:
+                        raise ToolInputError(
+                            code="INVALID_OPERATION",
+                            message=f"rows[{i}].{field}: {ve}",
+                        ) from ve
+
+                mtd_vals = metric_literals[:4]
+                ytd_vals = metric_literals[4:]
+
+                values_rows.append(
+                    f"({ek_lit}, {pl_key}, {fy_lit}, {fm_lit}, {ver_lit}, "
+                    f"{unit_lit}, "
+                    f"{mtd_vals[0]}, {mtd_vals[1]}, {mtd_vals[2]}, {mtd_vals[3]}, "
+                    f"NULL, NULL, NULL, NULL, "
+                    f"{ytd_vals[0]}, {ytd_vals[1]}, {ytd_vals[2]}, {ytd_vals[3]}, "
+                    f"NULL, NULL, NULL, NULL, "
+                    f"GETDATE())"
+                )
+
+            sql = (
+                f"INSERT INTO {_SCH1X_TABLE} ("
+                + ", ".join(_SCH1X_INSERT_COLUMNS)
+                + ") VALUES "
+                + ", ".join(values_rows)
+            )
+
+            affected = db.execute_write(sql)
+        except (ToolInputError, FabricQueryError) as e:
+            return error_envelope(e, tool="fabric_insert_sch1x_rows")
+
+        result = {
+            "rows_inserted": affected,
+            "entity_key": entity_key,
+            "fiscal_year": fiscal_year,
+            "fiscal_month": fiscal_month,
+            "version": version,
+        }
+        logger.info(
+            "Sch1X bulk insert completed: %d rows",
+            affected,
+            extra={
+                "tool": "fabric_insert_sch1x_rows",
+                "entity_key": entity_key,
+                "fiscal_year": fiscal_year,
+                "fiscal_month": fiscal_month,
+                "version": version,
+                "row_count": affected,
+            },
+        )
+        return json.dumps(result)

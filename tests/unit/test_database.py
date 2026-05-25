@@ -48,7 +48,7 @@ class TestFabricDatabase:
             ("id", int, None, None, None, None, False),
             ("name", str, None, None, None, None, True),
         ]
-        mock_cursor.fetchall.return_value = [(1, "Alice"), (2, "Bob")]
+        mock_cursor.fetchmany.side_effect = [[(1, "Alice"), (2, "Bob")], []]
         mock_connect.return_value.cursor.return_value = mock_cursor
 
         columns, rows = db.execute_query("SELECT id, name FROM test")
@@ -60,12 +60,45 @@ class TestFabricDatabase:
         assert rows[0] == {"id": 1, "name": "Alice"}
 
     @patch("src.database.pyodbc.connect")
+    def test_execute_query_uses_batched_fetchmany_not_fetchall(
+        self, mock_connect: MagicMock
+    ) -> None:
+        """Per pyodbc docs, cursor.fetchall() does NOT honor cursor.arraysize —
+        only fetchmany(N) gets batched SQLFetchScroll calls from the driver.
+        Lock in the batched path so a refactor cannot silently regress to
+        per-row fetches (the dominant Fabric round-trip cost)."""
+        from src.database import _FETCH_BATCH_SIZE
+
+        db, _ = self._make_db()
+        mock_cursor = MagicMock()
+        mock_cursor.description = [("id", int, None, None, None, None, False)]
+        # Two chunks then sentinel — proves the loop drives fetchmany repeatedly
+        # until it returns empty, not a single fetchall() call.
+        mock_cursor.fetchmany.side_effect = [[(1,), (2,)], [(3,)], []]
+        mock_connect.return_value.cursor.return_value = mock_cursor
+
+        _, rows = db.execute_query("SELECT id FROM t")
+
+        assert rows == [{"id": 1}, {"id": 2}, {"id": 3}]
+        assert mock_cursor.arraysize == _FETCH_BATCH_SIZE, (
+            "cursor.arraysize must be set so any later fetchmany() default-size "
+            "call also batches"
+        )
+        assert mock_cursor.fetchmany.call_count == 3, (
+            "expected 3 fetchmany calls (chunk, chunk, empty terminator)"
+        )
+        mock_cursor.fetchall.assert_not_called()
+        # Every fetchmany call must request the documented batch size.
+        for call in mock_cursor.fetchmany.call_args_list:
+            assert call.args == (_FETCH_BATCH_SIZE,)
+
+    @patch("src.database.pyodbc.connect")
     def test_execute_query_empty_result(self, mock_connect: MagicMock) -> None:
         db, _ = self._make_db()
 
         mock_cursor = MagicMock()
         mock_cursor.description = [("id", int, None, None, None, None, False)]
-        mock_cursor.fetchall.return_value = []
+        mock_cursor.fetchmany.return_value = []
         mock_connect.return_value.cursor.return_value = mock_cursor
 
         columns, rows = db.execute_query("SELECT id FROM empty_table")
@@ -188,11 +221,172 @@ class TestFabricDatabase:
         assert result == 3
 
     @patch("src.database.pyodbc.connect")
+    def test_execute_writes_empty_list_is_noop(self, mock_connect: MagicMock) -> None:
+        """Empty input must short-circuit before acquiring the connection —
+        the batch path must not pay handshake / cursor cost for zero work."""
+        db, _ = self._make_db()
+        assert db.execute_writes([]) == []
+        mock_connect.assert_not_called()
+
+    @patch("src.database.pyodbc.connect")
+    def test_execute_writes_batch_uses_single_lock_and_cursor(
+        self, mock_connect: MagicMock
+    ) -> None:
+        """The whole point of execute_writes: amortise the lock + cursor
+        + retry-stack overhead across N statements. Locking-in: one
+        cursor() call regardless of N, single connect() call."""
+        db, _ = self._make_db()
+
+        cursor = MagicMock()
+        # rowcount is read after each execute; the same value is fine here
+        # since we're checking call topology, not per-statement counts.
+        cursor.rowcount = 1
+        mock_connect.return_value.cursor.return_value = cursor
+
+        sqls = [
+            "INSERT INTO t (id) VALUES (1)",
+            "INSERT INTO t (id) VALUES (2)",
+            "INSERT INTO t (id) VALUES (3)",
+        ]
+        results = db.execute_writes(sqls)
+
+        assert results == [1, 1, 1]
+        assert mock_connect.call_count == 1, "single pyodbc.connect across batch"
+        assert mock_connect.return_value.cursor.call_count == 1, (
+            "single cursor allocated across batch — per-statement cursor() "
+            "would re-pay SQLAllocHandle for each row, defeating the point"
+        )
+        assert cursor.execute.call_count == 3
+        # Each statement was driven through the same cursor in order.
+        executed_sqls = [c.args[0] for c in cursor.execute.call_args_list]
+        assert executed_sqls == sqls
+
+    @patch("src.database.pyodbc.connect")
+    def test_execute_writes_per_statement_error_does_not_abort(
+        self, mock_connect: MagicMock
+    ) -> None:
+        """A query-side error on statement N must return a FabricQueryError
+        in slot N and continue executing statements N+1..end."""
+        import pyodbc
+
+        from src.database import FabricQueryError
+
+        db, _ = self._make_db()
+
+        cursor = MagicMock()
+        # statement 0 succeeds (rowcount=1), statement 1 raises,
+        # statement 2 succeeds (rowcount=2).
+        cursor.rowcount = 1
+        cursor.execute.side_effect = [
+            None,
+            pyodbc.Error("23000", "Violation of PRIMARY KEY constraint"),
+            None,
+        ]
+        mock_connect.return_value.cursor.return_value = cursor
+
+        results = db.execute_writes(
+            [
+                "INSERT INTO t VALUES (1)",
+                "INSERT INTO t VALUES (1)",  # duplicate → constraint error
+                "INSERT INTO t VALUES (2)",
+            ]
+        )
+
+        assert len(results) == 3
+        assert results[0] == 1
+        assert isinstance(results[1], FabricQueryError)
+        assert results[1].sqlstate == "23000"
+        assert "PRIMARY KEY" in results[1].message
+        assert results[2] == 1
+        # All three were attempted on the same cursor — no early abort.
+        assert cursor.execute.call_count == 3
+
+    @patch("src.database.pyodbc.connect")
+    def test_execute_writes_connection_error_mid_batch_reconnects(
+        self, mock_connect: MagicMock
+    ) -> None:
+        """If a connection-class error fires mid-batch, the cached
+        connection must be discarded, a fresh one opened, a fresh cursor
+        built, and the failing statement retried — same semantic as
+        execute_write's single-shot retry. Statements before the failure
+        keep their successes; statements after run on the new connection."""
+        import pyodbc
+
+        db, _ = self._make_db()
+
+        # First connection: statement 0 OK; statement 1 raises 08S01.
+        broken_conn = MagicMock(name="broken")
+        broken_cursor = MagicMock()
+        broken_cursor.rowcount = 1
+        broken_cursor.execute.side_effect = [
+            None,
+            pyodbc.Error("08S01", "Communication link failure"),
+        ]
+        broken_conn.cursor.return_value = broken_cursor
+
+        # Second connection: statement 1 retry succeeds; statement 2 OK.
+        good_conn = MagicMock(name="good")
+        good_cursor = MagicMock()
+        good_cursor.rowcount = 1
+        good_cursor.execute.side_effect = [None, None]
+        good_conn.cursor.return_value = good_cursor
+
+        mock_connect.side_effect = [broken_conn, good_conn]
+
+        results = db.execute_writes(
+            [
+                "INSERT INTO t VALUES (1)",
+                "INSERT INTO t VALUES (2)",
+                "INSERT INTO t VALUES (3)",
+            ]
+        )
+
+        assert results == [1, 1, 1]
+        assert mock_connect.call_count == 2, "expected one reconnect mid-batch"
+        broken_conn.close.assert_called()
+        # Statement 0 + the failed-then-retried statement 1 ran on broken cursor.
+        assert broken_cursor.execute.call_count == 2
+        # Statement 1 retry + statement 2 ran on the new cursor.
+        assert good_cursor.execute.call_count == 2
+
+    @patch("src.database.pyodbc.connect")
+    def test_execute_writes_connection_error_twice_records_error(
+        self, mock_connect: MagicMock
+    ) -> None:
+        """If the reconnect-and-retry attempt ALSO hits a connection
+        error, that statement is recorded as FabricQueryError (no infinite
+        loop) and the batch moves on."""
+        import pyodbc
+
+        from src.database import FabricQueryError
+
+        db, _ = self._make_db()
+
+        first = MagicMock(name="first")
+        first_cursor = MagicMock()
+        first_cursor.execute.side_effect = pyodbc.Error("08S01", "link down")
+        first.cursor.return_value = first_cursor
+
+        second = MagicMock(name="second")
+        second_cursor = MagicMock()
+        second_cursor.execute.side_effect = pyodbc.Error("08S01", "still down")
+        second.cursor.return_value = second_cursor
+
+        mock_connect.side_effect = [first, second]
+
+        results = db.execute_writes(["INSERT INTO t VALUES (1)"])
+
+        assert len(results) == 1
+        assert isinstance(results[0], FabricQueryError)
+        assert results[0].sqlstate == "08S01"
+        assert mock_connect.call_count == 2, "exactly one retry, no looping"
+
+    @patch("src.database.pyodbc.connect")
     def test_connection_uses_token_auth(self, mock_connect: MagicMock) -> None:
         db, mock_auth = self._make_db()
         mock_cursor = MagicMock()
         mock_cursor.description = [("id", int, None, None, None, None, False)]
-        mock_cursor.fetchall.return_value = []
+        mock_cursor.fetchmany.return_value = []
         mock_connect.return_value.cursor.return_value = mock_cursor
 
         db.execute_query("SELECT 1")
@@ -207,7 +401,7 @@ class TestFabricDatabase:
         db, _ = self._make_db()
         mock_cursor = MagicMock()
         mock_cursor.description = [("id", int, None, None, None, None, False)]
-        mock_cursor.fetchall.return_value = []
+        mock_cursor.fetchmany.return_value = []
         mock_connect.return_value.cursor.return_value = mock_cursor
 
         db.execute_query("SELECT 1")
@@ -232,7 +426,7 @@ class TestConnectionReuse:
     def _stub_cursor(self, mock_connect: MagicMock) -> MagicMock:
         cursor = MagicMock()
         cursor.description = [("id", int, None, None, None, None, False)]
-        cursor.fetchall.return_value = []
+        cursor.fetchmany.return_value = []
         cursor.rowcount = 0
         mock_connect.return_value.cursor.return_value = cursor
         return cursor
@@ -286,7 +480,7 @@ class TestConnectionReuse:
         good_conn = MagicMock(name="good_conn")
         good_cursor = MagicMock()
         good_cursor.description = [("id", int, None, None, None, None, False)]
-        good_cursor.fetchall.return_value = [(1,)]
+        good_cursor.fetchmany.side_effect = [[(1,)], []]
         good_conn.cursor.return_value = good_cursor
 
         mock_connect.side_effect = [broken_conn, good_conn]
@@ -312,7 +506,7 @@ class TestConnectionReuse:
 
         good_cursor = MagicMock()
         good_cursor.description = [("id", int, None, None, None, None, False)]
-        good_cursor.fetchall.return_value = []
+        good_cursor.fetchmany.return_value = []
 
         mock_connect.return_value.cursor.side_effect = [bad_cursor, good_cursor]
 
@@ -538,7 +732,7 @@ class TestStaleConnectionRecovery:
         good = MagicMock(name="good")
         good_cursor = MagicMock()
         good_cursor.description = [("id", int, None, None, None, None, False)]
-        good_cursor.fetchall.return_value = [(42,)]
+        good_cursor.fetchmany.side_effect = [[(42,)], []]
         good.cursor.return_value = good_cursor
 
         mock_connect.side_effect = [broken, good]
@@ -558,7 +752,7 @@ class TestStaleConnectionRecovery:
         db, _ = self._make_db()
         cursor = MagicMock()
         cursor.description = [("id", int, None, None, None, None, False)]
-        cursor.fetchall.return_value = []
+        cursor.fetchmany.return_value = []
         mock_connect.return_value.cursor.return_value = cursor
 
         db.execute_query("SELECT 1")
@@ -583,7 +777,7 @@ class TestStaleConnectionRecovery:
         db, _ = self._make_db()
         cursor = MagicMock()
         cursor.description = [("id", int, None, None, None, None, False)]
-        cursor.fetchall.return_value = []
+        cursor.fetchmany.return_value = []
         mock_connect.return_value.cursor.return_value = cursor
 
         db.execute_query("SELECT 1")
@@ -607,7 +801,7 @@ class TestStaleConnectionRecovery:
         db, _ = self._make_db()
         cursor = MagicMock()
         cursor.description = [("id", int, None, None, None, None, False)]
-        cursor.fetchall.return_value = []
+        cursor.fetchmany.return_value = []
         mock_connect.return_value.cursor.return_value = cursor
 
         db.execute_query("SELECT 1")
@@ -644,7 +838,7 @@ class TestObservability:
         db, _ = self._make_db()
         cursor = MagicMock()
         cursor.description = [("id", int, None, None, None, None, False)]
-        cursor.fetchall.return_value = [(1,)]
+        cursor.fetchmany.side_effect = [[(1,)], []]
         mock_connect.return_value.cursor.return_value = cursor
 
         with caplog.at_level(logging.INFO, logger="fabric_mcp.database"):
@@ -681,7 +875,7 @@ class TestObservability:
         good = MagicMock(name="good")
         good_cursor = MagicMock()
         good_cursor.description = [("id", int, None, None, None, None, False)]
-        good_cursor.fetchall.return_value = []
+        good_cursor.fetchmany.return_value = []
         good.cursor.return_value = good_cursor
 
         mock_connect.side_effect = [broken, good]
