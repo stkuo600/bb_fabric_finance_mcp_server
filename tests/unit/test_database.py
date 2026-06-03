@@ -302,15 +302,20 @@ class TestFabricDatabase:
         assert cursor.execute.call_count == 3
 
     @patch("src.database.pyodbc.connect")
-    def test_execute_writes_connection_error_mid_batch_reconnects(
+    def test_execute_writes_connection_error_mid_batch_does_not_retry_failed_stmt(
         self, mock_connect: MagicMock
     ) -> None:
-        """If a connection-class error fires mid-batch, the cached
-        connection must be discarded, a fresh one opened, a fresh cursor
-        built, and the failing statement retried — same semantic as
-        execute_write's single-shot retry. Statements before the failure
-        keep their successes; statements after run on the new connection."""
+        """If a connection-class error fires mid-batch, the failing statement
+        must NOT be re-executed (its server-side commit state is unknown — a
+        retry would double-apply). It is flagged WRITE_STATE_UNKNOWN, the
+        connection is rebuilt, and *subsequent* statements continue on the new
+        connection. Statements before the failure keep their successes.
+
+        Updated from the prior retry-the-failed-statement contract, which
+        silently double-applied non-idempotent writes (review finding P2)."""
         import pyodbc
+
+        from src.database import FabricQueryError
 
         db, _ = self._make_db()
 
@@ -324,11 +329,12 @@ class TestFabricDatabase:
         ]
         broken_conn.cursor.return_value = broken_cursor
 
-        # Second connection: statement 1 retry succeeds; statement 2 OK.
+        # Second connection: only statement 2 runs here (statement 1 is NOT
+        # retried).
         good_conn = MagicMock(name="good")
         good_cursor = MagicMock()
         good_cursor.rowcount = 1
-        good_cursor.execute.side_effect = [None, None]
+        good_cursor.execute.side_effect = [None]
         good_conn.cursor.return_value = good_cursor
 
         mock_connect.side_effect = [broken_conn, good_conn]
@@ -341,45 +347,212 @@ class TestFabricDatabase:
             ]
         )
 
-        assert results == [1, 1, 1]
-        assert mock_connect.call_count == 2, "expected one reconnect mid-batch"
+        assert results[0] == 1
+        assert isinstance(results[1], FabricQueryError), (
+            "the dropped statement must be flagged, not silently retried"
+        )
+        assert results[1].code == "WRITE_STATE_UNKNOWN"
+        assert results[1].sqlstate == "08S01"
+        assert results[2] == 1
+        assert mock_connect.call_count == 2, "rebuild the connection once for stmt 2"
         broken_conn.close.assert_called()
-        # Statement 0 + the failed-then-retried statement 1 ran on broken cursor.
+        # Statement 0 + the dropped statement 1 ran on broken cursor — and
+        # statement 1 was NOT re-executed.
         assert broken_cursor.execute.call_count == 2
-        # Statement 1 retry + statement 2 ran on the new cursor.
-        assert good_cursor.execute.call_count == 2
+        # Only statement 2 ran on the new cursor (no retry of statement 1).
+        assert good_cursor.execute.call_count == 1
 
     @patch("src.database.pyodbc.connect")
-    def test_execute_writes_connection_error_twice_records_error(
+    def test_execute_writes_connection_error_flags_unknown_state_no_retry(
         self, mock_connect: MagicMock
     ) -> None:
-        """If the reconnect-and-retry attempt ALSO hits a connection
-        error, that statement is recorded as FabricQueryError (no infinite
-        loop) and the batch moves on."""
+        """A single batched write that drops mid-flight is flagged
+        WRITE_STATE_UNKNOWN and is NOT re-executed (no second connection, no
+        second execute)."""
         import pyodbc
 
         from src.database import FabricQueryError
 
         db, _ = self._make_db()
 
-        first = MagicMock(name="first")
-        first_cursor = MagicMock()
-        first_cursor.execute.side_effect = pyodbc.Error("08S01", "link down")
-        first.cursor.return_value = first_cursor
-
-        second = MagicMock(name="second")
-        second_cursor = MagicMock()
-        second_cursor.execute.side_effect = pyodbc.Error("08S01", "still down")
-        second.cursor.return_value = second_cursor
-
-        mock_connect.side_effect = [first, second]
+        conn = MagicMock(name="conn")
+        cursor = MagicMock()
+        cursor.execute.side_effect = pyodbc.Error("08S01", "link down")
+        conn.cursor.return_value = cursor
+        mock_connect.return_value = conn
 
         results = db.execute_writes(["INSERT INTO t VALUES (1)"])
 
         assert len(results) == 1
         assert isinstance(results[0], FabricQueryError)
+        assert results[0].code == "WRITE_STATE_UNKNOWN"
         assert results[0].sqlstate == "08S01"
-        assert mock_connect.call_count == 2, "exactly one retry, no looping"
+        assert cursor.execute.call_count == 1, "the write must not be re-executed"
+        assert mock_connect.call_count == 1, "no reconnect needed — nothing left to run"
+
+
+class TestWriteRetrySafety:
+    """Writes must not be auto-retried on a connection-class error: under
+    autocommit the server may have committed before the drop/timeout, so a
+    retry double-applies a non-idempotent write (review findings P1/P2/P10).
+    Reads stay retryable (idempotent)."""
+
+    def _make_db(self) -> tuple[FabricDatabase, MagicMock]:
+        mock_auth = MagicMock()
+        mock_auth.get_token.return_value = "test-access-token"
+        db = FabricDatabase(
+            server="test.datawarehouse.fabric.microsoft.com",
+            database="gold_warehouse",
+            auth=mock_auth,
+        )
+        return db, mock_auth
+
+    @patch("src.database.pyodbc.connect")
+    def test_execute_write_does_not_retry_on_connection_drop(
+        self, mock_connect: MagicMock
+    ) -> None:
+        """P1: an 08S01 mid-flight drop on a write must NOT re-execute the
+        statement. Surface WRITE_STATE_UNKNOWN so the caller can reconcile."""
+        import pyodbc
+
+        from src.database import FabricQueryError
+
+        db, _ = self._make_db()
+        cursor = MagicMock()
+        cursor.rowcount = 1
+        cursor.execute.side_effect = pyodbc.Error("08S01", "Communication link failure")
+        mock_connect.return_value.cursor.return_value = cursor
+
+        with pytest.raises(FabricQueryError) as exc_info:
+            db.execute_write("INSERT INTO raw.Fact_Sch1X (x) VALUES (1)")
+
+        assert exc_info.value.code == "WRITE_STATE_UNKNOWN"
+        assert exc_info.value.sqlstate == "08S01"
+        assert cursor.execute.call_count == 1, "write must run exactly once (no retry)"
+
+    @patch("src.database.pyodbc.connect")
+    def test_execute_write_does_not_retry_on_timeout(
+        self, mock_connect: MagicMock
+    ) -> None:
+        """P1/P10: a HYT00 timeout gives no signal about server-side commit
+        state, so the write must NOT be retried."""
+        import pyodbc
+
+        from src.database import FabricQueryError
+
+        db, _ = self._make_db()
+        cursor = MagicMock()
+        cursor.rowcount = 1
+        cursor.execute.side_effect = pyodbc.Error("HYT00", "Query timeout expired")
+        mock_connect.return_value.cursor.return_value = cursor
+
+        with pytest.raises(FabricQueryError) as exc_info:
+            db.execute_write("UPDATE raw.Fact_Sch1X SET x=1")
+
+        assert exc_info.value.code == "WRITE_STATE_UNKNOWN"
+        assert cursor.execute.call_count == 1
+
+    @patch("src.database.pyodbc.connect")
+    def test_execute_write_discards_connection_on_drop(
+        self, mock_connect: MagicMock
+    ) -> None:
+        """The dropped connection must be discarded so the next call opens a
+        fresh one (don't keep reusing a dead socket)."""
+        import pyodbc
+
+        from src.database import FabricQueryError
+
+        db, _ = self._make_db()
+        conn = MagicMock(name="conn")
+        cursor = MagicMock()
+        cursor.execute.side_effect = pyodbc.Error("08S01", "link failure")
+        conn.cursor.return_value = cursor
+        mock_connect.return_value = conn
+
+        with pytest.raises(FabricQueryError):
+            db.execute_write("INSERT INTO t VALUES (1)")
+
+        conn.close.assert_called()
+
+    @patch("src.database.pyodbc.connect")
+    def test_query_still_retries_on_connection_drop(
+        self, mock_connect: MagicMock
+    ) -> None:
+        """Regression guard: reads are idempotent and MUST keep the
+        reconnect-and-retry behavior."""
+        import pyodbc
+
+        db, _ = self._make_db()
+
+        broken = MagicMock(name="broken")
+        broken_cursor = MagicMock()
+        broken_cursor.execute.side_effect = pyodbc.Error("08S01", "link failure")
+        broken.cursor.return_value = broken_cursor
+
+        good = MagicMock(name="good")
+        good_cursor = MagicMock()
+        good_cursor.description = [("id", int, None, None, None, None, False)]
+        good_cursor.fetchmany.side_effect = [[(1,)], []]
+        good.cursor.return_value = good_cursor
+
+        mock_connect.side_effect = [broken, good]
+
+        _, rows = db.execute_query("SELECT 1")
+
+        assert rows == [{"id": 1}]
+        assert mock_connect.call_count == 2, "reads must still reconnect-and-retry"
+
+    @patch("src.database.pyodbc.connect")
+    def test_write_resets_residual_query_timeout(
+        self, mock_connect: MagicMock
+    ) -> None:
+        """P10: a write's effective timeout must be deterministic, not inherited
+        from the last query's residual conn.timeout on the shared connection."""
+        db, _ = self._make_db()
+        conn = mock_connect.return_value
+        cursor = MagicMock()
+        cursor.description = [("id", int, None, None, None, None, False)]
+        cursor.fetchmany.return_value = []
+        cursor.rowcount = 1
+        conn.cursor.return_value = cursor
+
+        db.execute_query("SELECT 1", timeout=30)
+        assert conn.timeout == 30, "query sets its own timeout"
+
+        db.execute_write("UPDATE t SET c=1")
+        assert conn.timeout == 0, (
+            "write must set a deterministic timeout, not inherit the query's 30s"
+        )
+
+    @patch("src.database.pyodbc.connect")
+    def test_execute_with_retry_no_retry_flag_surfaces_unknown_state(
+        self, mock_connect: MagicMock
+    ) -> None:
+        """Seam test: with retry_on_connection_error=False, a connection-class
+        error runs the op exactly once and raises WRITE_STATE_UNKNOWN."""
+        import pyodbc
+
+        from src.database import FabricQueryError
+
+        db, _ = self._make_db()
+        mock_connect.return_value = MagicMock(name="conn")
+
+        calls: list[object] = []
+
+        def op(conn: object) -> tuple[object, int]:
+            calls.append(conn)
+            raise pyodbc.Error("08S01", "link failure")
+
+        with pytest.raises(FabricQueryError) as exc_info:
+            db._execute_with_retry(
+                op,
+                op_label="write",
+                sql_for_hash="INSERT INTO t VALUES (1)",
+                retry_on_connection_error=False,
+            )
+
+        assert exc_info.value.code == "WRITE_STATE_UNKNOWN"
+        assert len(calls) == 1, "op must run exactly once (no retry)"
 
     @patch("src.database.pyodbc.connect")
     def test_connection_uses_token_auth(self, mock_connect: MagicMock) -> None:
