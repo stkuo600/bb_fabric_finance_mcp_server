@@ -44,9 +44,18 @@ class FabricAuth:
             logger.info("Token acquired successfully")
             return result["access_token"]
 
+        # Log the full MSAL diagnostics server-side only; the raw AADSTS text
+        # (error codes, trace/correlation IDs, sometimes tenant/app GUIDs) is
+        # reconnaissance-grade and must not cross the trust boundary to the
+        # client. The client gets a stable code + generic message.
+        logger.error(
+            "Token acquisition failed: %s (error=%s)",
+            result.get("error_description", "Unknown error"),
+            result.get("error"),
+        )
         error = ErrorResponse(
             code="AUTH_FAILED",
-            message=f"Authentication failed: {result.get('error_description', 'Unknown error')}",
-            details=result.get("error"),
+            message="Authentication to the upstream identity provider failed.",
+            details=None,
         )
         raise RuntimeError(error.model_dump_json())
