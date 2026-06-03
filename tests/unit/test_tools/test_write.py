@@ -204,6 +204,95 @@ class TestFabricExecuteWrite:
         assert result["code"] == "TOKEN_EXPIRED"
 
 
+class TestTokenSigningKeyDecoupledFromClientSecret:
+    """The confirmation-token signing key must NOT be tied to client_secret:
+    rotating the (frequently-rotated) AAD client_secret must not invalidate
+    in-flight tokens, and replicas sharing a dedicated signing key must verify
+    each other's tokens (P6)."""
+
+    def test_token_survives_client_secret_rotation(self) -> None:
+        # Both configs share FABRIC_TOKEN_SIGNING_KEY but have different
+        # client_secret (rotated). A token issued under one must redeem on
+        # the other.
+        issuer_cfg = _make_config(
+            client_secret="SECRET-v1", token_signing_key="stable-signing-key"
+        )
+        redeemer_cfg = _make_config(
+            client_secret="SECRET-v2", token_signing_key="stable-signing-key"
+        )
+
+        issuer = _make_write_tools(config=issuer_cfg)
+        preview_fn, _ = issuer["fabric_preview_write"]
+        token = json.loads(
+            preview_fn("INSERT INTO gold.transactions (id) VALUES (1)")
+        )["confirmation_token"]
+
+        redeemer = _make_write_tools(config=redeemer_cfg)
+        execute_fn, mock_db = redeemer["fabric_execute_write"]
+        mock_db.execute_write.return_value = 1
+
+        result = json.loads(execute_fn(token))
+        assert result.get("code") != "TOKEN_INVALID", (
+            f"a dedicated signing key must survive client_secret rotation; got {result}"
+        )
+        assert result["affected_rows"] == 1
+
+    def test_batch_token_survives_client_secret_rotation(self) -> None:
+        issuer_cfg = _make_config(
+            client_secret="SECRET-v1", token_signing_key="stable-signing-key"
+        )
+        redeemer_cfg = _make_config(
+            client_secret="SECRET-v2", token_signing_key="stable-signing-key"
+        )
+        issuer = _make_write_tools(config=issuer_cfg)
+        preview_fn, _ = issuer["fabric_preview_write"]
+        token = json.loads(
+            preview_fn("INSERT INTO gold.transactions (id) VALUES (1)")
+        )["confirmation_token"]
+
+        redeemer = _make_write_tools(config=redeemer_cfg)
+        batch_fn, mock_db = redeemer["fabric_execute_write_batch"]
+        mock_db.execute_writes.return_value = [1]
+
+        result = json.loads(batch_fn([token]))
+        assert result["total_succeeded"] == 1, (
+            f"batch redemption must also survive rotation; got {result}"
+        )
+
+    def test_wrong_signing_key_still_rejected(self) -> None:
+        """A token signed with a different signing key must still be rejected
+        (the decoupling must not weaken signature verification)."""
+        issuer_cfg = _make_config(token_signing_key="key-A")
+        redeemer_cfg = _make_config(token_signing_key="key-B")
+
+        issuer = _make_write_tools(config=issuer_cfg)
+        preview_fn, _ = issuer["fabric_preview_write"]
+        token = json.loads(
+            preview_fn("INSERT INTO gold.transactions (id) VALUES (1)")
+        )["confirmation_token"]
+
+        redeemer = _make_write_tools(config=redeemer_cfg)
+        execute_fn, _ = redeemer["fabric_execute_write"]
+        result = json.loads(execute_fn(token))
+        assert result["code"] == "TOKEN_INVALID"
+
+    def test_fallback_to_client_secret_when_no_signing_key(self) -> None:
+        """Backward compatible: with no FABRIC_TOKEN_SIGNING_KEY configured,
+        the token still works end-to-end under a single client_secret."""
+        cfg = _make_config(client_secret="only-secret")  # token_signing_key unset
+        tools = _make_write_tools(config=cfg)
+        preview_fn, _ = tools["fabric_preview_write"]
+        execute_fn, mock_db = tools["fabric_execute_write"]
+        mock_db.execute_write.return_value = 1
+
+        token = json.loads(
+            preview_fn("INSERT INTO gold.transactions (id) VALUES (1)")
+        )["confirmation_token"]
+        result = json.loads(execute_fn(token))
+        assert result.get("code") != "TOKEN_INVALID"
+        assert result["affected_rows"] == 1
+
+
 class TestStatelessToken:
     """Confirmation tokens must be redeemable across independent server instances
     (different Container Apps replicas) that share the same configuration.

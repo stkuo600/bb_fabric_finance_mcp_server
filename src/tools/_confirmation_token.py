@@ -6,10 +6,12 @@ The token format is a single dotted string ``<payload_b64>.<sig_b64>``:
 - ``payload_b64`` is the URL-safe base64 of a UTF-8 JSON object
   matching ``ConfirmationTokenPayload``.
 - ``sig_b64`` is the URL-safe base64 of ``HMAC-SHA256(signing_key,
-  payload_b64)``. The signing key is derived from the shared
-  ``client_secret`` via a domain-separated SHA-256 so an attacker who
-  somehow obtains the secret cannot reuse it for another protocol's
-  HMAC.
+  payload_b64)``. The signing key is derived from the caller-supplied
+  ``secret`` via a domain-separated SHA-256 so an attacker who somehow
+  obtains the secret cannot reuse it for another protocol's HMAC. Callers
+  pass a dedicated, rotation-stable signing key (``FABRIC_TOKEN_SIGNING_KEY``)
+  rather than the AAD ``client_secret`` — see
+  ``.claude/bugfix/2026-06-03-token-signing-key-rotation/report.md``.
 
 The design is stateless on purpose — see
 ``.claude/bugfix/2026-05-22-write-token-cross-instance/report.md``.

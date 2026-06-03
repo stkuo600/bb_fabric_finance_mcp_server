@@ -139,6 +139,26 @@ def _escape_sql_string(s: str) -> str:
     return s.replace("'", "''")
 
 
+def _token_signing_key(config: FabricSettings) -> str:
+    """Resolve the HMAC signing material for confirmation tokens.
+
+    Prefer the dedicated, rotation-stable ``FABRIC_TOKEN_SIGNING_KEY``. Fall
+    back to ``client_secret`` only for backward compatibility — but warn,
+    because the AAD ``client_secret`` is rotated periodically on ACA and any
+    rotation would invalidate all in-flight tokens and break cross-replica
+    verification (see .claude/bugfix/2026-06-03-token-signing-key-rotation).
+    """
+    if config.token_signing_key:
+        return config.token_signing_key
+    logger.warning(
+        "FABRIC_TOKEN_SIGNING_KEY is not set; confirmation tokens are signed with "
+        "client_secret and will be invalidated when it rotates. Set a dedicated "
+        "FABRIC_TOKEN_SIGNING_KEY so tokens survive AAD-secret rotation.",
+        extra={"tool": "fabric_write"},
+    )
+    return config.client_secret
+
+
 def _parse_write_sql(sql: str) -> tuple[str, str] | None:
     """Extract operation type and target table from INSERT/UPDATE SQL.
 
@@ -210,7 +230,7 @@ def register_write_tools(mcp: FastMCP, db: FabricDatabase, config: FabricSetting
 
         for i, token in enumerate(confirmation_tokens):
             try:
-                payload = parse_confirmation_token(token, config.client_secret)
+                payload = parse_confirmation_token(token, _token_signing_key(config))
             except ToolInputError as e:
                 results[i] = {"status": "error", "code": e.code, "message": e.message}
                 continue
@@ -426,7 +446,7 @@ def register_write_tools(mcp: FastMCP, db: FabricDatabase, config: FabricSetting
             sql=sql,
             op=operation,
             table=table,
-            secret=config.client_secret,
+            secret=_token_signing_key(config),
             expires_in=timedelta(minutes=config.write_token_expiry_minutes),
         )
 
@@ -461,7 +481,7 @@ def register_write_tools(mcp: FastMCP, db: FabricDatabase, config: FabricSetting
         )
 
         try:
-            payload = parse_confirmation_token(confirmation_token, config.client_secret)
+            payload = parse_confirmation_token(confirmation_token, _token_signing_key(config))
             ensure_token_not_expired(payload, now=datetime.now(tz=UTC).timestamp())
             affected_rows = db.execute_write(payload.sql)
         except (ToolInputError, FabricQueryError) as e:

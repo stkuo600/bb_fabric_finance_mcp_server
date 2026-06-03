@@ -53,10 +53,16 @@ FABRIC_DATABASE=gold_warehouse
 FABRIC_CLIENT_ID=your-client-id
 FABRIC_CLIENT_SECRET=your-client-secret
 FABRIC_TENANT_ID=your-tenant-id
+FABRIC_TOKEN_SIGNING_KEY=a-long-random-shared-secret
 FABRIC_WRITE_ALLOWLIST=dbo.table1,dbo.table2
 FABRIC_MAX_ROWS=500
 FABRIC_PORT=8000
 ```
+
+`FABRIC_TOKEN_SIGNING_KEY` signs write confirmation tokens. Set it to a long random
+value shared across all replicas so tokens survive `client_secret` rotation and verify
+cross-replica. If omitted, the server falls back to `client_secret` (logging a warning)
+and rotating the secret will invalidate outstanding confirmation tokens.
 
 ## MCP Tools Available
 
