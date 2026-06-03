@@ -26,7 +26,11 @@ from src.tools._confirmation_token import (
     parse_confirmation_token,
 )
 from src.tools._responses import ToolInputError, error_envelope
-from src.tools._validators import validate_int_range, validate_writable_table
+from src.tools._validators import (
+    validate_int_range,
+    validate_single_statement,
+    validate_writable_table,
+)
 
 logger = logging.getLogger("fabric_mcp.tools.write")
 
@@ -389,16 +393,18 @@ def register_write_tools(mcp: FastMCP, db: FabricDatabase, config: FabricSetting
     def fabric_preview_write(sql: str) -> str:
         """Preview a write operation and receive a confirmation token. Does NOT execute the SQL.
 
-        Only INSERT and UPDATE statements are accepted. The target table must be on the
-        configured write allowlist. Returns a confirmation token that must be passed to
+        Only a single INSERT or UPDATE statement is accepted. The target table must be on
+        the configured write allowlist. Multi-statement batches (anything after a `;`
+        separator) are rejected. Returns a confirmation token that must be passed to
         fabric_execute_write to actually execute the operation.
 
         Args:
-            sql: SQL INSERT or UPDATE statement to preview.
+            sql: A single SQL INSERT or UPDATE statement to preview.
         """
         logger.info("Write preview requested", extra={"tool": "fabric_preview_write"})
 
         try:
+            validate_single_statement(sql)
             parsed = _parse_write_sql(sql)
             if parsed is None:
                 raise ToolInputError(
