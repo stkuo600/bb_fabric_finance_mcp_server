@@ -93,6 +93,44 @@ class TestFabricDatabase:
             assert call.args == (_FETCH_BATCH_SIZE,)
 
     @patch("src.database.pyodbc.connect")
+    def test_execute_query_bounds_fetch_to_max_rows_plus_one(
+        self, mock_connect: MagicMock
+    ) -> None:
+        """With max_rows set, execute_query must stop fetching at cap+1 rows
+        (cap+1 so the caller can still detect truncation) instead of draining
+        the whole result set into memory (P8)."""
+        db, _ = self._make_db()
+        mock_cursor = MagicMock()
+        mock_cursor.description = [("id", int, None, None, None, None, False)]
+        # First chunk already holds far more than the cap; a draining impl would
+        # also call fetchmany again for the terminator.
+        mock_cursor.fetchmany.side_effect = [[(i,) for i in range(10_000)], []]
+        mock_connect.return_value.cursor.return_value = mock_cursor
+
+        _, rows = db.execute_query("SELECT id FROM huge", max_rows=2)
+
+        assert len(rows) == 3, "must materialise at most cap+1 rows, not the whole set"
+        assert mock_cursor.fetchmany.call_count == 1, (
+            "must stop fetching once cap+1 is reached, not drain to the terminator"
+        )
+
+    @patch("src.database.pyodbc.connect")
+    def test_execute_query_without_max_rows_still_drains(
+        self, mock_connect: MagicMock
+    ) -> None:
+        """Regression: with no max_rows (e.g. internal schema queries), the full
+        result set is still returned."""
+        db, _ = self._make_db()
+        mock_cursor = MagicMock()
+        mock_cursor.description = [("id", int, None, None, None, None, False)]
+        mock_cursor.fetchmany.side_effect = [[(1,), (2,)], [(3,)], []]
+        mock_connect.return_value.cursor.return_value = mock_cursor
+
+        _, rows = db.execute_query("SELECT id FROM t")
+
+        assert rows == [{"id": 1}, {"id": 2}, {"id": 3}]
+
+    @patch("src.database.pyodbc.connect")
     def test_execute_query_empty_result(self, mock_connect: MagicMock) -> None:
         db, _ = self._make_db()
 

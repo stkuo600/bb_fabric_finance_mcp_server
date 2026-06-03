@@ -352,12 +352,22 @@ class FabricDatabase:
                     return result
             raise RuntimeError("unreachable")  # pragma: no cover
 
-    def execute_query(self, sql: str, timeout: int = 30) -> tuple[list[ColumnInfo], list[dict[str, object]]]:
+    def execute_query(
+        self, sql: str, timeout: int = 30, max_rows: int | None = None
+    ) -> tuple[list[ColumnInfo], list[dict[str, object]]]:
         """Execute a read-only SQL query and return column metadata and rows.
 
         Returns (columns, rows) where rows are dicts keyed by column name.
         Raises FabricQueryError on failure (code, message, details, sqlstate).
+
+        ``max_rows`` bounds the client-side fetch: at most ``max_rows + 1`` rows
+        are materialised (the ``+ 1`` lets the caller still detect truncation)
+        instead of draining the entire result set into memory — important on
+        memory-limited replicas where a large ``SELECT`` could otherwise OOM the
+        process. ``None`` (e.g. internal schema queries) drains as before.
         """
+        fetch_limit = None if max_rows is None else max_rows + 1
+
         def op(
             conn: pyodbc.Connection,
         ) -> tuple[tuple[list[ColumnInfo], list[dict[str, object]]], int]:
@@ -380,6 +390,11 @@ class FabricDatabase:
                 if not chunk:
                     break
                 rows.extend(dict(zip(col_names, row, strict=False)) for row in chunk)
+                if fetch_limit is not None and len(rows) >= fetch_limit:
+                    # Stop draining once we have cap+1; the caller truncates to
+                    # cap and reports truncated=true.
+                    del rows[fetch_limit:]
+                    break
             return (columns, rows), len(rows)
 
         return self._execute_with_retry(op, op_label="query", sql_for_hash=sql)
