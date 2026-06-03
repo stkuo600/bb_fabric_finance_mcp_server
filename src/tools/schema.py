@@ -97,6 +97,10 @@ def register_schema_tools(mcp: FastMCP, db: FabricDatabase) -> None:
 
         Accepts table names with or without schema qualifier (e.g., "gold.transactions" or "transactions").
 
+        If an unqualified name exists in more than one schema, the call is
+        rejected with TABLE_AMBIGUOUS listing the candidate schemas — re-run with
+        a schema-qualified name.
+
         Args:
             table_name: Table name, optionally schema-qualified (e.g., "gold.transactions").
         """
@@ -127,6 +131,20 @@ def register_schema_tools(mcp: FastMCP, db: FabricDatabase) -> None:
                     code="TABLE_NOT_FOUND",
                     message=f"Table '{table_name}' not found in the data warehouse",
                 )
+            if schema is None:
+                # Unqualified name: if it resolves to more than one schema, the
+                # rows would merge columns from distinct physical tables. Refuse
+                # and list the candidates instead of silently conflating them.
+                candidate_schemas = sorted({row["TABLE_SCHEMA"] for row in rows})
+                if len(candidate_schemas) > 1:
+                    raise ToolInputError(
+                        code="TABLE_AMBIGUOUS",
+                        message=(
+                            f"Table '{table}' exists in multiple schemas: "
+                            f"{', '.join(candidate_schemas)}. Re-run with a "
+                            f"schema-qualified name (e.g. '{candidate_schemas[0]}.{table}')."
+                        ),
+                    )
         except (ToolInputError, FabricQueryError) as e:
             return error_envelope(e, tool="fabric_describe_table")
 
