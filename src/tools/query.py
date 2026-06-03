@@ -82,7 +82,9 @@ def register_query_tools(mcp: FastMCP, db: FabricDatabase, config: FabricSetting
                 validate_int_range(max_rows, name="max_rows", lo=1, hi=10000)
 
             effective_cap = max_rows if max_rows is not None else config.max_rows
-            columns, rows = db.execute_query(sql, timeout=30)
+            # Push the cap down so the fetch is bounded to effective_cap+1 rows
+            # rather than draining the whole result set into memory.
+            columns, rows = db.execute_query(sql, timeout=30, max_rows=effective_cap)
         except (ToolInputError, FabricQueryError) as e:
             return error_envelope(e, tool="fabric_execute_query")
 

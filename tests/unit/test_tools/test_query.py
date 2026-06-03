@@ -92,6 +92,22 @@ class TestFabricExecuteQuery:
         result = json.loads(fn("DELETE FROM test"))
         assert result["code"] == "INVALID_OPERATION"
 
+    def test_passes_effective_cap_to_db_execute_query(self) -> None:
+        """The row cap must be pushed down to db.execute_query so the fetch is
+        bounded (cap+1), not applied only after draining the whole result (P8)."""
+        config = _make_config(max_rows=500)
+        fn, mock_db = _make_query_tool(config=config)
+        mock_db.execute_query.return_value = (
+            [ColumnInfo(name="id", type="int", nullable=False)],
+            [{"id": 1}],
+        )
+
+        json.loads(fn("SELECT id FROM t"))
+        assert mock_db.execute_query.call_args.kwargs.get("max_rows") == 500
+
+        json.loads(fn("SELECT id FROM t", max_rows=10))
+        assert mock_db.execute_query.call_args.kwargs.get("max_rows") == 10
+
     def test_truncation_when_exceeding_max_rows(self) -> None:
         config = _make_config(max_rows=2)
         fn, mock_db = _make_query_tool(config=config)
