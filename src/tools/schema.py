@@ -156,7 +156,12 @@ def register_schema_tools(mcp: FastMCP, db: FabricDatabase) -> None:
             data_type = row["DATA_TYPE"]
             if row.get("CHARACTER_MAXIMUM_LENGTH"):
                 data_type = f"{data_type}({row['CHARACTER_MAXIMUM_LENGTH']})"
-            elif row.get("NUMERIC_PRECISION") and row.get("NUMERIC_SCALE"):
+            elif (
+                row.get("NUMERIC_PRECISION") is not None
+                and row.get("NUMERIC_SCALE") is not None
+            ):
+                # Test presence, not truthiness: NUMERIC_SCALE == 0 for
+                # integer-scale numerics like DECIMAL(18,0), and 0 is falsy.
                 data_type = f"{data_type}({row['NUMERIC_PRECISION']},{row['NUMERIC_SCALE']})"
             columns.append(
                 ColumnInfo(

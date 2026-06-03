@@ -256,6 +256,37 @@ class TestFabricDescribeTable:
         assert result["schema_name"] == "gold"
         assert [c["name"] for c in result["columns"]] == ["id", "amount"]
 
+    def test_zero_scale_numeric_keeps_precision(self) -> None:
+        """DECIMAL(p,0) / NUMERIC(p,0) have NUMERIC_SCALE == 0 (falsy). The
+        precision/scale must still be rendered — bare 'decimal' loses the
+        declared precision and misleads the caller (P7)."""
+        tools = _make_schema_tools()
+        fn, mock_db = tools["fabric_describe_table"]
+        mock_db.execute_query.return_value = (
+            [ColumnInfo(name="TABLE_SCHEMA", type="str", nullable=False)],
+            [
+                {
+                    "TABLE_SCHEMA": "gold", "TABLE_TYPE": "BASE TABLE",
+                    "COLUMN_NAME": "amount", "DATA_TYPE": "decimal",
+                    "IS_NULLABLE": "NO", "CHARACTER_MAXIMUM_LENGTH": None,
+                    "NUMERIC_PRECISION": 18, "NUMERIC_SCALE": 0,
+                },
+                {
+                    "TABLE_SCHEMA": "gold", "TABLE_TYPE": "BASE TABLE",
+                    "COLUMN_NAME": "rate", "DATA_TYPE": "decimal",
+                    "IS_NULLABLE": "NO", "CHARACTER_MAXIMUM_LENGTH": None,
+                    "NUMERIC_PRECISION": 18, "NUMERIC_SCALE": 6,
+                },
+            ],
+        )
+
+        result = json.loads(fn("gold.t"))
+        types = {c["name"]: c["type"] for c in result["columns"]}
+        assert types["amount"] == "decimal(18,0)", (
+            f"zero-scale numeric must keep precision; got {types['amount']}"
+        )
+        assert types["rate"] == "decimal(18,6)"
+
     def test_table_not_found(self) -> None:
         tools = _make_schema_tools()
         fn, mock_db = tools["fabric_describe_table"]
