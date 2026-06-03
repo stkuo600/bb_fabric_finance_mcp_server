@@ -23,12 +23,14 @@ _BRACKET_IDENT = re.compile(r"\[[^\]]*\]")
 _QUOTED_IDENT = re.compile(r'"[^"]*"')
 
 
-def _strip_sql_literals_and_comments(sql: str) -> str:
+def strip_sql_literals_and_comments(sql: str) -> str:
     """Blank out SQL comments and string/identifier literals so a subsequent
     structural scan does not see separators or keywords that live inside them.
 
     Handles: ``--`` line comments, ``/* */`` block comments, ``'...'`` strings
-    (with ``''`` escape), ``[...]`` and ``"..."`` quoted identifiers.
+    (with ``''`` escape), ``[...]`` and ``"..."`` quoted identifiers. Shared by
+    the read-only-query guard and the write-preview single-statement check so
+    both apply identical literal/comment handling.
     """
     sql = _LINE_COMMENT.sub("", sql)
     sql = _BLOCK_COMMENT.sub("", sql)
@@ -38,20 +40,28 @@ def _strip_sql_literals_and_comments(sql: str) -> str:
     return sql
 
 
+def is_single_statement(sql: str) -> bool:
+    """Return True if ``sql`` is a single statement (a single trailing ``;``,
+    and semicolons confined to literals/comments, are allowed).
+
+    SQL Server / pyodbc executes every ``;``-separated statement in one batch, so
+    anything after the first ``;`` (once literals/comments are stripped) is a
+    second statement.
+    """
+    cleaned = strip_sql_literals_and_comments(sql)
+    _, _, after_first_separator = cleaned.partition(";")
+    return not after_first_separator.strip()
+
+
 def validate_single_statement(sql: str) -> str:
     """Return ``sql`` if it is a single statement; raise INVALID_OPERATION otherwise.
 
-    SQL Server / pyodbc executes every ``;``-separated statement in one batch, so
-    a leading allowlisted statement followed by a stacked statement (e.g.
+    A leading allowlisted statement followed by a stacked statement (e.g.
     ``INSERT INTO ok ...; UPDATE secret ...``, ``...; DROP TABLE x``) would run
-    the trailing statement under the same privileged connection. After stripping
-    literals and comments, reject any non-whitespace content following the first
-    ``;``. A single trailing ``;`` (and semicolons confined to literals/comments)
-    is allowed.
+    the trailing statement under the same privileged connection — see
+    ``is_single_statement``.
     """
-    cleaned = _strip_sql_literals_and_comments(sql)
-    _, _, after_first_separator = cleaned.partition(";")
-    if after_first_separator.strip():
+    if not is_single_statement(sql):
         raise ToolInputError(
             code="INVALID_OPERATION",
             message=(

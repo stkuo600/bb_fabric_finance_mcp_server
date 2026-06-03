@@ -12,27 +12,16 @@ from src.config import FabricSettings
 from src.database import FabricDatabase, FabricQueryError
 from src.models import QueryResult
 from src.tools._responses import ToolInputError, error_envelope
-from src.tools._validators import validate_int_range
+from src.tools._validators import (
+    is_single_statement,
+    strip_sql_literals_and_comments,
+    validate_int_range,
+)
 
 logger = logging.getLogger("fabric_mcp.tools.query")
 
 _READ_PREFIX = re.compile(r"^\s*(?:SELECT|WITH)\b", re.IGNORECASE)
 _WRITE_DML = re.compile(r"\b(?:INSERT|UPDATE|DELETE|MERGE)\b", re.IGNORECASE)
-
-
-def _strip_literals_and_comments(sql: str) -> str:
-    """Strip SQL comments and string/identifier literals so a subsequent
-    keyword scan does not match text inside them.
-
-    Handles: `--` line comments, `/* */` block comments, `'...'` strings
-    (with `''` escape), `[...]` and `"..."` quoted identifiers.
-    """
-    sql = re.sub(r"--[^\n]*", "", sql)
-    sql = re.sub(r"/\*.*?\*/", "", sql, flags=re.DOTALL)
-    sql = re.sub(r"'(?:[^']|'')*'", "''", sql)
-    sql = re.sub(r"\[[^\]]*\]", "[]", sql)
-    sql = re.sub(r'"[^"]*"', '""', sql)
-    return sql
 
 
 def _is_read_only_query(sql: str) -> bool:
@@ -55,10 +44,9 @@ def _is_read_only_query(sql: str) -> bool:
     """
     if not _READ_PREFIX.match(sql):
         return False
-    cleaned = _strip_literals_and_comments(sql)
-    _, _, after_first_separator = cleaned.partition(";")
-    if after_first_separator.strip():
+    if not is_single_statement(sql):
         return False
+    cleaned = strip_sql_literals_and_comments(sql)
     return _WRITE_DML.search(cleaned) is None
 
 
