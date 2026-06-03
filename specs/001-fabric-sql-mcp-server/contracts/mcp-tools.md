@@ -79,6 +79,7 @@ Preview a write operation and receive a confirmation token. Does NOT execute the
 - Only INSERT and UPDATE statements are accepted.
 - Target table must be on the configured write allowlist.
 - Token expires after `write_token_expiry_minutes` (default 15, configurable 1–60 via `FABRIC_WRITE_TOKEN_EXPIRY_MINUTES`).
+- Tokens are HMAC-signed with a dedicated signing key from `FABRIC_TOKEN_SIGNING_KEY` (rotation-stable, independent of the AAD `client_secret`). If unset, the server falls back to `client_secret` and logs a warning — in that mode, rotating `client_secret` invalidates outstanding tokens. Set `FABRIC_TOKEN_SIGNING_KEY` (shared across replicas) so tokens survive secret rotation and verify cross-replica.
 - Token payload carries `iat` (issued-at, POSIX seconds) alongside `exp` for forensic / audit use; `iat` is informational only and is not enforced by the verifier.
 - Does NOT execute the SQL — only validates and returns a preview.
 

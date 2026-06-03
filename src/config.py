@@ -51,6 +51,7 @@ class FabricSettings(BaseSettings):
     client_secret: str
     tenant_id: str
     api_key: str
+    token_signing_key: str | None = None
     write_allowlist: Annotated[list[str], NoDecode] = []
     max_rows: int = 500
     port: int = 8000
