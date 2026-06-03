@@ -97,6 +97,76 @@ class TestFabricPreviewWrite:
 
         assert result["code"] == "TABLE_NOT_ALLOWED"
 
+
+class TestPreviewWriteStackedStatementsRejected:
+    """The write allowlist is only checked against the first parsed table, but
+    the whole SQL is signed and later executed verbatim. A second `;`-stacked
+    statement targeting a non-allowlisted table (or arbitrary DDL) must be
+    rejected at preview so no token is ever minted for it (P4)."""
+
+    def test_stacked_update_to_unallowlisted_table_rejected(self) -> None:
+        tools = _make_write_tools()
+        fn, _ = tools["fabric_preview_write"]
+        sql = "INSERT INTO gold.transactions (id) VALUES (1); UPDATE secret.audit_log SET role=99"
+        result = json.loads(fn(sql))
+        assert result["code"] == "INVALID_OPERATION"
+        assert "confirmation_token" not in result
+
+    def test_stacked_drop_rejected(self) -> None:
+        tools = _make_write_tools()
+        fn, _ = tools["fabric_preview_write"]
+        sql = "INSERT INTO gold.transactions (id) VALUES (1); DROP TABLE gold.accounts"
+        result = json.loads(fn(sql))
+        assert result["code"] == "INVALID_OPERATION"
+        assert "confirmation_token" not in result
+
+    def test_stacked_second_insert_to_allowlisted_table_rejected(self) -> None:
+        """Even when BOTH targets are allowlisted, multi-statement batches are
+        rejected — a single token must redeem exactly one statement."""
+        tools = _make_write_tools()
+        fn, _ = tools["fabric_preview_write"]
+        sql = (
+            "INSERT INTO gold.transactions (id) VALUES (1); "
+            "INSERT INTO gold.accounts (id) VALUES (2)"
+        )
+        result = json.loads(fn(sql))
+        assert result["code"] == "INVALID_OPERATION"
+        assert "confirmation_token" not in result
+
+    def test_stacked_separator_in_string_literal_not_masked(self) -> None:
+        """A `;` inside a string literal is not a separator, but a real trailing
+        statement after it still must be rejected."""
+        tools = _make_write_tools()
+        fn, _ = tools["fabric_preview_write"]
+        sql = "INSERT INTO gold.transactions (note) VALUES ('a;b'); DROP TABLE gold.accounts"
+        result = json.loads(fn(sql))
+        assert result["code"] == "INVALID_OPERATION"
+        assert "confirmation_token" not in result
+
+
+class TestPreviewWriteSingleStatementSemicolonAllowed:
+    """A single write statement with a trailing `;` (or semicolons confined to
+    string literals) is legitimate and must still mint a token."""
+
+    def test_trailing_semicolon_allowed(self) -> None:
+        tools = _make_write_tools()
+        fn, _ = tools["fabric_preview_write"]
+        result = json.loads(fn("INSERT INTO gold.transactions (id) VALUES (1);"))
+        assert result.get("code") != "INVALID_OPERATION", (
+            f"a single trailing semicolon must be allowed; got {result}"
+        )
+        assert "confirmation_token" in result
+
+    def test_semicolon_in_string_literal_allowed(self) -> None:
+        tools = _make_write_tools()
+        fn, _ = tools["fabric_preview_write"]
+        result = json.loads(fn("INSERT INTO gold.transactions (note) VALUES ('a;b')"))
+        assert result.get("code") != "INVALID_OPERATION", (
+            f"a semicolon inside a string literal must not be treated as a "
+            f"statement separator; got {result}"
+        )
+        assert "confirmation_token" in result
+
     def test_non_write_rejected(self) -> None:
         tools = _make_write_tools()
         fn, _ = tools["fabric_preview_write"]

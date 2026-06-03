@@ -12,7 +12,54 @@ this module testable without mocks.
 
 from __future__ import annotations
 
+import re
+
 from src.tools._responses import ToolInputError
+
+_LINE_COMMENT = re.compile(r"--[^\n]*")
+_BLOCK_COMMENT = re.compile(r"/\*.*?\*/", re.DOTALL)
+_STRING_LITERAL = re.compile(r"'(?:[^']|'')*'")
+_BRACKET_IDENT = re.compile(r"\[[^\]]*\]")
+_QUOTED_IDENT = re.compile(r'"[^"]*"')
+
+
+def _strip_sql_literals_and_comments(sql: str) -> str:
+    """Blank out SQL comments and string/identifier literals so a subsequent
+    structural scan does not see separators or keywords that live inside them.
+
+    Handles: ``--`` line comments, ``/* */`` block comments, ``'...'`` strings
+    (with ``''`` escape), ``[...]`` and ``"..."`` quoted identifiers.
+    """
+    sql = _LINE_COMMENT.sub("", sql)
+    sql = _BLOCK_COMMENT.sub("", sql)
+    sql = _STRING_LITERAL.sub("''", sql)
+    sql = _BRACKET_IDENT.sub("[]", sql)
+    sql = _QUOTED_IDENT.sub('""', sql)
+    return sql
+
+
+def validate_single_statement(sql: str) -> str:
+    """Return ``sql`` if it is a single statement; raise INVALID_OPERATION otherwise.
+
+    SQL Server / pyodbc executes every ``;``-separated statement in one batch, so
+    a leading allowlisted statement followed by a stacked statement (e.g.
+    ``INSERT INTO ok ...; UPDATE secret ...``, ``...; DROP TABLE x``) would run
+    the trailing statement under the same privileged connection. After stripping
+    literals and comments, reject any non-whitespace content following the first
+    ``;``. A single trailing ``;`` (and semicolons confined to literals/comments)
+    is allowed.
+    """
+    cleaned = _strip_sql_literals_and_comments(sql)
+    _, _, after_first_separator = cleaned.partition(";")
+    if after_first_separator.strip():
+        raise ToolInputError(
+            code="INVALID_OPERATION",
+            message=(
+                "Only a single SQL statement is allowed; multi-statement batches "
+                "(anything after a `;` separator) are rejected."
+            ),
+        )
+    return sql
 
 
 def validate_int_range(value: int, *, name: str, lo: int, hi: int) -> int:
