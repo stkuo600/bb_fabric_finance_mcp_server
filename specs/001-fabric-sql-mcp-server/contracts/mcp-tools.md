@@ -306,6 +306,7 @@ Get column details for a specific table.
 | INVALID_OPERATION | Wrong SQL statement type for this tool |
 | TABLE_NOT_ALLOWED | Target table not on write allowlist |
 | TABLE_NOT_FOUND | Specified table does not exist |
+| TABLE_AMBIGUOUS | An unqualified table name in `fabric_describe_table` exists in more than one schema; the message lists the candidate schemas. Re-run with a schema-qualified name. |
 | TOKEN_EXPIRED | Write confirmation token has expired |
 | TOKEN_INVALID | Write confirmation token is missing, malformed, or has an invalid signature |
 | CONFIG_ERROR | Server misconfiguration |

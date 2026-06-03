@@ -187,6 +187,75 @@ class TestFabricDescribeTable:
         assert result["columns"][0]["type"] == "nvarchar(255)"
         assert result["columns"][0]["nullable"] is True
 
+    def test_unqualified_name_ambiguous_across_schemas_rejected(self) -> None:
+        """An unqualified name that exists in more than one schema must NOT
+        silently merge columns from the different physical tables — it must
+        return TABLE_AMBIGUOUS listing the candidate schemas so the caller
+        can re-query with a schema qualifier (P5)."""
+        tools = _make_schema_tools()
+        fn, mock_db = tools["fabric_describe_table"]
+        mock_db.execute_query.return_value = (
+            [ColumnInfo(name="TABLE_SCHEMA", type="str", nullable=False)],
+            [
+                {
+                    "TABLE_SCHEMA": "gold", "TABLE_TYPE": "BASE TABLE",
+                    "COLUMN_NAME": "id", "DATA_TYPE": "int", "IS_NULLABLE": "NO",
+                    "CHARACTER_MAXIMUM_LENGTH": None,
+                    "NUMERIC_PRECISION": 10, "NUMERIC_SCALE": 0,
+                },
+                {
+                    "TABLE_SCHEMA": "raw", "TABLE_TYPE": "BASE TABLE",
+                    "COLUMN_NAME": "raw_blob", "DATA_TYPE": "varchar",
+                    "IS_NULLABLE": "YES", "CHARACTER_MAXIMUM_LENGTH": 4000,
+                    "NUMERIC_PRECISION": None, "NUMERIC_SCALE": None,
+                },
+                {
+                    "TABLE_SCHEMA": "gold", "TABLE_TYPE": "BASE TABLE",
+                    "COLUMN_NAME": "amount", "DATA_TYPE": "decimal",
+                    "IS_NULLABLE": "YES", "CHARACTER_MAXIMUM_LENGTH": None,
+                    "NUMERIC_PRECISION": 18, "NUMERIC_SCALE": 2,
+                },
+            ],
+        )
+
+        result = json.loads(fn("transactions"))
+
+        assert result["code"] == "TABLE_AMBIGUOUS", (
+            f"unqualified name in multiple schemas must be rejected; got {result}"
+        )
+        # The candidate schemas must be disclosed so the caller can qualify.
+        assert "gold" in result["message"] and "raw" in result["message"]
+        assert "columns" not in result
+
+    def test_unqualified_name_single_schema_multiple_columns_ok(self) -> None:
+        """Regression guard: multiple columns of a single table (all the same
+        TABLE_SCHEMA) must NOT be mistaken for cross-schema ambiguity."""
+        tools = _make_schema_tools()
+        fn, mock_db = tools["fabric_describe_table"]
+        mock_db.execute_query.return_value = (
+            [ColumnInfo(name="TABLE_SCHEMA", type="str", nullable=False)],
+            [
+                {
+                    "TABLE_SCHEMA": "gold", "TABLE_TYPE": "BASE TABLE",
+                    "COLUMN_NAME": "id", "DATA_TYPE": "int", "IS_NULLABLE": "NO",
+                    "CHARACTER_MAXIMUM_LENGTH": None,
+                    "NUMERIC_PRECISION": 10, "NUMERIC_SCALE": 0,
+                },
+                {
+                    "TABLE_SCHEMA": "gold", "TABLE_TYPE": "BASE TABLE",
+                    "COLUMN_NAME": "amount", "DATA_TYPE": "decimal",
+                    "IS_NULLABLE": "YES", "CHARACTER_MAXIMUM_LENGTH": None,
+                    "NUMERIC_PRECISION": 18, "NUMERIC_SCALE": 2,
+                },
+            ],
+        )
+
+        result = json.loads(fn("transactions"))
+
+        assert result.get("code") != "TABLE_AMBIGUOUS"
+        assert result["schema_name"] == "gold"
+        assert [c["name"] for c in result["columns"]] == ["id", "amount"]
+
     def test_table_not_found(self) -> None:
         tools = _make_schema_tools()
         fn, mock_db = tools["fabric_describe_table"]
