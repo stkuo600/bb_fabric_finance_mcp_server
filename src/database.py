@@ -207,6 +207,22 @@ class FabricDatabase:
                 self._conn.close()
             self._conn = None
 
+    def _redact_identifiers(self, text: str) -> str:
+        """Remove backend identifiers from a client-facing error message.
+
+        ODBC/Fabric diagnostics embed the Fabric server FQDN and database name;
+        returning them verbatim across the MCP trust boundary is reconnaissance-
+        grade information disclosure. Replace those identifiers with
+        ``<redacted>`` while preserving useful query-side text (e.g. "Invalid
+        object name") that helps the caller self-correct. The full raw text is
+        logged server-side for diagnosis.
+        """
+        redacted = text
+        for ident in (self._server, self._database):
+            if ident:
+                redacted = redacted.replace(ident, "<redacted>")
+        return redacted
+
     def _execute_with_retry(
         self,
         operation: Callable[[pyodbc.Connection], tuple[_T, int]],
@@ -270,6 +286,7 @@ class FabricDatabase:
                                     "attempt": attempt,
                                     "query_duration_ms": duration_ms,
                                     "sql_hash": h,
+                                    "error_detail": str(e),
                                 },
                             )
                             self._discard_connection()
@@ -278,10 +295,10 @@ class FabricDatabase:
                                     "Connection lost during write; the statement may or "
                                     "may not have committed. It was NOT retried to avoid "
                                     "duplicate application — verify the table state before "
-                                    f"retrying. ({e})"
+                                    "retrying."
                                 ),
                                 code="WRITE_STATE_UNKNOWN",
-                                details=_hint_for_fabric_error(str(e)),
+                                details=None,
                                 sqlstate=sqlstate,
                             ) from e
                         logger.warning(
@@ -296,6 +313,7 @@ class FabricDatabase:
                         )
                         self._discard_connection()
                         continue
+                    raw = str(e)
                     logger.error(
                         "%s failed after attempt %d",
                         op_label,
@@ -306,9 +324,12 @@ class FabricDatabase:
                             "attempt": attempt,
                             "query_duration_ms": duration_ms,
                             "sql_hash": h,
+                            # Full raw error retained server-side only; the
+                            # client-facing message below is identifier-scrubbed.
+                            "error_detail": raw,
                         },
                     )
-                    message = str(e)
+                    message = self._redact_identifiers(raw)
                     raise FabricQueryError(
                         message=message,
                         details=_hint_for_fabric_error(message),
@@ -431,6 +452,7 @@ class FabricDatabase:
                     sqlstate = (
                         e.args[0] if e.args and isinstance(e.args[0], str) else None
                     )
+                    raw = str(e)
                     if _is_connection_error(e):
                         logger.error(
                             "Batch write: connection lost at index %d; commit state "
@@ -442,6 +464,7 @@ class FabricDatabase:
                                 "query_duration_ms": duration_ms,
                                 "sql_hash": sql_h,
                                 "batch_index": idx,
+                                "error_detail": raw,
                             },
                         )
                         # Drop the dead connection; rebuild lazily for the next
@@ -454,10 +477,10 @@ class FabricDatabase:
                                     "Connection lost during write; the statement may or "
                                     "may not have committed. It was NOT retried to avoid "
                                     "duplicate application — verify the table state before "
-                                    f"retrying. ({e})"
+                                    "retrying."
                                 ),
                                 code="WRITE_STATE_UNKNOWN",
-                                details=_hint_for_fabric_error(str(e)),
+                                details=None,
                                 sqlstate=sqlstate,
                             )
                         )
@@ -471,9 +494,10 @@ class FabricDatabase:
                             "query_duration_ms": duration_ms,
                             "sql_hash": sql_h,
                             "batch_index": idx,
+                            "error_detail": raw,
                         },
                     )
-                    message = str(e)
+                    message = self._redact_identifiers(raw)
                     results.append(
                         FabricQueryError(
                             message=message,
