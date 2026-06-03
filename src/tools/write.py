@@ -450,7 +450,8 @@ def register_write_tools(mcp: FastMCP, db: FabricDatabase, config: FabricSetting
         """Execute a previously previewed write operation using a confirmation token.
 
         The token must have been obtained from fabric_preview_write and must not be
-        expired (5-minute validity).
+        expired. Validity is set by `write_token_expiry_minutes` (default 15,
+        configurable 1-60 via FABRIC_WRITE_TOKEN_EXPIRY_MINUTES).
 
         Args:
             confirmation_token: Token from fabric_preview_write.
