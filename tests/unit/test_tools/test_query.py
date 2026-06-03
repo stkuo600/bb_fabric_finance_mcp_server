@@ -290,3 +290,109 @@ class TestCommonTableExpression:
         )
         result = json.loads(fn("SELECT id /* historic: INSERT path removed */ FROM t"))
         assert result.get("code") != "INVALID_OPERATION"
+
+
+class TestStackedStatementsRejected:
+    """A SELECT/WITH followed by one or more `;`-separated statements must be
+    rejected. SQL Server/pyodbc executes every `;`-separated statement in one
+    batch, so a trailing DDL/DCL/EXEC stacked behind a leading SELECT would run
+    under the privileged service principal (P3, Critical)."""
+
+    def test_stacked_drop_rejected(self) -> None:
+        fn, mock_db = _make_query_tool()
+        result = json.loads(fn("SELECT 1; DROP TABLE raw.Fact_Sch1X"))
+        assert result["code"] == "INVALID_OPERATION"
+        mock_db.execute_query.assert_not_called()
+
+    def test_stacked_truncate_rejected(self) -> None:
+        fn, mock_db = _make_query_tool()
+        result = json.loads(fn("SELECT 1; TRUNCATE TABLE raw.Fact_ExchangeRate"))
+        assert result["code"] == "INVALID_OPERATION"
+        mock_db.execute_query.assert_not_called()
+
+    def test_stacked_alter_rejected(self) -> None:
+        fn, mock_db = _make_query_tool()
+        result = json.loads(fn("SELECT * FROM x; ALTER TABLE x ADD c INT"))
+        assert result["code"] == "INVALID_OPERATION"
+        mock_db.execute_query.assert_not_called()
+
+    def test_stacked_create_rejected(self) -> None:
+        fn, mock_db = _make_query_tool()
+        result = json.loads(fn("SELECT 1; CREATE TABLE foo (a int)"))
+        assert result["code"] == "INVALID_OPERATION"
+        mock_db.execute_query.assert_not_called()
+
+    def test_stacked_grant_rejected(self) -> None:
+        fn, mock_db = _make_query_tool()
+        result = json.loads(fn("SELECT 1; GRANT CONTROL ON DATABASE::wh TO attacker"))
+        assert result["code"] == "INVALID_OPERATION"
+        mock_db.execute_query.assert_not_called()
+
+    def test_stacked_exec_rejected(self) -> None:
+        fn, mock_db = _make_query_tool()
+        result = json.loads(fn("SELECT 1; EXEC sp_who"))
+        assert result["code"] == "INVALID_OPERATION"
+        mock_db.execute_query.assert_not_called()
+
+    def test_stacked_insert_rejected(self) -> None:
+        """Already partly covered by _WRITE_DML, but must hold via the
+        statement-separator rule too."""
+        fn, mock_db = _make_query_tool()
+        result = json.loads(fn("SELECT 1; INSERT INTO t VALUES (1)"))
+        assert result["code"] == "INVALID_OPERATION"
+        mock_db.execute_query.assert_not_called()
+
+    def test_stacked_statement_with_internal_semicolon_in_literal_rejected(self) -> None:
+        """The leading SELECT is legitimate, but a real second statement follows
+        — the `;` inside the literal must not mask the real separator."""
+        fn, mock_db = _make_query_tool()
+        result = json.loads(fn("SELECT 'a;b' AS c; DROP TABLE t"))
+        assert result["code"] == "INVALID_OPERATION"
+        mock_db.execute_query.assert_not_called()
+
+
+class TestSingleStatementSemicolonAllowed:
+    """A single statement with a trailing semicolon (or semicolons confined to
+    string literals / comments) is legitimate and must remain allowed."""
+
+    def test_trailing_semicolon_allowed(self) -> None:
+        fn, mock_db = _make_query_tool()
+        mock_db.execute_query.return_value = (
+            [ColumnInfo(name="id", type="int", nullable=False)],
+            [{"id": 1}],
+        )
+        result = json.loads(fn("SELECT id FROM raw.Dim_Entity;"))
+        assert result.get("code") != "INVALID_OPERATION", (
+            f"a single trailing semicolon must be allowed; got {result}"
+        )
+        mock_db.execute_query.assert_called_once()
+
+    def test_trailing_semicolon_with_whitespace_allowed(self) -> None:
+        fn, mock_db = _make_query_tool()
+        mock_db.execute_query.return_value = (
+            [ColumnInfo(name="id", type="int", nullable=False)],
+            [],
+        )
+        result = json.loads(fn("SELECT id FROM t ;  \n"))
+        assert result.get("code") != "INVALID_OPERATION"
+
+    def test_semicolon_inside_string_literal_allowed(self) -> None:
+        fn, mock_db = _make_query_tool()
+        mock_db.execute_query.return_value = (
+            [ColumnInfo(name="c", type="str", nullable=False)],
+            [{"c": "a;b"}],
+        )
+        result = json.loads(fn("SELECT 'a;b' AS c"))
+        assert result.get("code") != "INVALID_OPERATION", (
+            f"a semicolon inside a string literal must not be treated as a "
+            f"statement separator; got {result}"
+        )
+
+    def test_cte_with_trailing_semicolon_allowed(self) -> None:
+        fn, mock_db = _make_query_tool()
+        mock_db.execute_query.return_value = (
+            [ColumnInfo(name="x", type="int", nullable=False)],
+            [{"x": 1}],
+        )
+        result = json.loads(fn("WITH cte AS (SELECT 1 AS x) SELECT * FROM cte;"))
+        assert result.get("code") != "INVALID_OPERATION"
