@@ -213,6 +213,7 @@ class FabricDatabase:
         *,
         op_label: str,
         sql_for_hash: str,
+        retry_on_connection_error: bool = True,
     ) -> _T:
         """Run ``operation`` against the cached connection with one immediate
         reconnect-and-retry on connection-class pyodbc errors.
@@ -235,6 +236,15 @@ class FabricDatabase:
         raised carrying the Fabric-specific hint (if any) and the
         originating SQLSTATE.
 
+        ``retry_on_connection_error`` gates the reconnect-and-retry. Reads
+        (idempotent) keep the default ``True``. Writes pass ``False``:
+        under ``autocommit=True`` the Fabric server may have committed the
+        statement before a mid-flight drop (``08S01``) or client timeout
+        (``HYT00``) is observed, so re-executing would double-apply a
+        non-idempotent write. Instead the connection is discarded and a
+        ``WRITE_STATE_UNKNOWN`` ``FabricQueryError`` is raised so the caller
+        can reconcile rather than silently duplicate the write.
+
         Concurrency: the cached connection is serialised with ``_lock`` —
         pyodbc connections are not safe for concurrent cursor use, and
         FastMCP's ``streamable-http`` transport can dispatch sync tools
@@ -250,6 +260,30 @@ class FabricDatabase:
                     duration_ms = int((time.perf_counter() - t0) * 1000)
                     sqlstate = e.args[0] if e.args and isinstance(e.args[0], str) else None
                     if attempt == 0 and _is_connection_error(e):
+                        if not retry_on_connection_error:
+                            logger.error(
+                                "Connection lost during write; commit state unknown, "
+                                "not retrying to avoid duplicate application",
+                                extra={
+                                    "operation": op_label,
+                                    "sqlstate": sqlstate or "",
+                                    "attempt": attempt,
+                                    "query_duration_ms": duration_ms,
+                                    "sql_hash": h,
+                                },
+                            )
+                            self._discard_connection()
+                            raise FabricQueryError(
+                                message=(
+                                    "Connection lost during write; the statement may or "
+                                    "may not have committed. It was NOT retried to avoid "
+                                    "duplicate application — verify the table state before "
+                                    f"retrying. ({e})"
+                                ),
+                                code="WRITE_STATE_UNKNOWN",
+                                details=_hint_for_fabric_error(str(e)),
+                                sqlstate=sqlstate,
+                            ) from e
                         logger.warning(
                             "Connection-class error, reconnecting and retrying",
                             extra={
@@ -335,12 +369,23 @@ class FabricDatabase:
         Raises FabricQueryError on failure (code, message, details, sqlstate).
         """
         def op(conn: pyodbc.Connection) -> tuple[int, int]:
+            # Deterministic write timeout: 0 = unbounded (the original
+            # no-explicit-write-timeout intent). Without this, a write would
+            # inherit the residual conn.timeout left by the last execute_query
+            # on the shared cached connection, making write timeouts
+            # nondeterministic and manufacturing spurious HYT00 aborts.
+            conn.timeout = 0
             cursor = conn.cursor()
             cursor.execute(sql)
             affected = cursor.rowcount
             return affected, affected
 
-        return self._execute_with_retry(op, op_label="write", sql_for_hash=sql)
+        # Writes are not auto-retried on connection-class errors: under
+        # autocommit a mid-flight drop/timeout may follow a server-side commit,
+        # so a retry would double-apply a non-idempotent write.
+        return self._execute_with_retry(
+            op, op_label="write", sql_for_hash=sql, retry_on_connection_error=False
+        )
 
     def execute_writes(self, sqls: list[str]) -> list[int | FabricQueryError]:
         """Execute a batch of write SQL statements under a single lock + cursor.
@@ -349,10 +394,13 @@ class FabricDatabase:
         row count (success) or a ``FabricQueryError`` (failure). Per-statement
         errors do NOT abort the batch — later statements still execute.
 
-        Connection-class errors retain ``execute_write``'s recovery semantic:
-        the cached connection is discarded, a fresh one is opened, a fresh
-        cursor is built, and the failing statement is retried exactly once.
-        Subsequent statements continue on the recovered connection.
+        Connection-class errors are NOT retried for the failing statement:
+        under ``autocommit`` a mid-flight drop/timeout may follow a server-side
+        commit, so re-executing would double-apply a non-idempotent write. The
+        failing slot is recorded as a ``WRITE_STATE_UNKNOWN`` ``FabricQueryError``,
+        the dead connection is discarded, and a fresh one is built lazily for the
+        *next* statement so subsequent statements still run. Query-side errors
+        keep the connection and the batch continues on it.
 
         Why this exists instead of looping ``execute_write`` at the call site:
         each ``execute_write`` re-acquires ``_lock``, re-runs the retry stack,
@@ -366,73 +414,87 @@ class FabricDatabase:
 
         results: list[int | FabricQueryError] = []
         with self._lock:
-            conn = self._get_connection()
-            cursor = conn.cursor()
+            cursor: pyodbc.Cursor | None = None
             for idx, sql in enumerate(sqls):
+                if cursor is None:
+                    conn = self._get_connection()
+                    # Deterministic write timeout — see execute_write.
+                    conn.timeout = 0
+                    cursor = conn.cursor()
                 sql_h = _sql_hash(sql)
-                for attempt in (0, 1):
-                    t0 = time.perf_counter()
-                    try:
-                        cursor.execute(sql)
-                        affected = cursor.rowcount
-                    except pyodbc.Error as e:
-                        duration_ms = int((time.perf_counter() - t0) * 1000)
-                        sqlstate = (
-                            e.args[0] if e.args and isinstance(e.args[0], str) else None
-                        )
-                        if attempt == 0 and _is_connection_error(e):
-                            logger.warning(
-                                "Batch write: connection-class error, reconnecting",
-                                extra={
-                                    "operation": "write_batch",
-                                    "sqlstate": sqlstate or "",
-                                    "attempt": attempt,
-                                    "query_duration_ms": duration_ms,
-                                    "sql_hash": sql_h,
-                                    "batch_index": idx,
-                                },
-                            )
-                            self._discard_connection()
-                            conn = self._get_connection()
-                            cursor = conn.cursor()
-                            continue
+                t0 = time.perf_counter()
+                try:
+                    cursor.execute(sql)
+                    affected = cursor.rowcount
+                except pyodbc.Error as e:
+                    duration_ms = int((time.perf_counter() - t0) * 1000)
+                    sqlstate = (
+                        e.args[0] if e.args and isinstance(e.args[0], str) else None
+                    )
+                    if _is_connection_error(e):
                         logger.error(
-                            "Batch write failed at index %d after attempt %d",
+                            "Batch write: connection lost at index %d; commit state "
+                            "unknown, not retrying to avoid duplicate application",
                             idx,
-                            attempt,
                             extra={
                                 "operation": "write_batch",
                                 "sqlstate": sqlstate or "",
-                                "attempt": attempt,
                                 "query_duration_ms": duration_ms,
                                 "sql_hash": sql_h,
                                 "batch_index": idx,
                             },
                         )
-                        message = str(e)
+                        # Drop the dead connection; rebuild lazily for the next
+                        # statement (cursor=None). Do NOT re-execute this one.
+                        self._discard_connection()
+                        cursor = None
                         results.append(
                             FabricQueryError(
-                                message=message,
-                                details=_hint_for_fabric_error(message),
+                                message=(
+                                    "Connection lost during write; the statement may or "
+                                    "may not have committed. It was NOT retried to avoid "
+                                    "duplicate application — verify the table state before "
+                                    f"retrying. ({e})"
+                                ),
+                                code="WRITE_STATE_UNKNOWN",
+                                details=_hint_for_fabric_error(str(e)),
                                 sqlstate=sqlstate,
                             )
                         )
-                        break
-                    else:
-                        duration_ms = int((time.perf_counter() - t0) * 1000)
-                        logger.info(
-                            "Batch write executed at index %d: %d rows",
-                            idx,
-                            affected,
-                            extra={
-                                "operation": "write_batch",
-                                "row_count": affected,
-                                "query_duration_ms": duration_ms,
-                                "sql_hash": sql_h,
-                                "attempt": attempt,
-                                "batch_index": idx,
-                            },
+                        continue
+                    logger.error(
+                        "Batch write failed at index %d",
+                        idx,
+                        extra={
+                            "operation": "write_batch",
+                            "sqlstate": sqlstate or "",
+                            "query_duration_ms": duration_ms,
+                            "sql_hash": sql_h,
+                            "batch_index": idx,
+                        },
+                    )
+                    message = str(e)
+                    results.append(
+                        FabricQueryError(
+                            message=message,
+                            details=_hint_for_fabric_error(message),
+                            sqlstate=sqlstate,
                         )
-                        results.append(affected)
-                        break
+                    )
+                    continue
+                else:
+                    duration_ms = int((time.perf_counter() - t0) * 1000)
+                    logger.info(
+                        "Batch write executed at index %d: %d rows",
+                        idx,
+                        affected,
+                        extra={
+                            "operation": "write_batch",
+                            "row_count": affected,
+                            "query_duration_ms": duration_ms,
+                            "sql_hash": sql_h,
+                            "batch_index": idx,
+                        },
+                    )
+                    results.append(affected)
         return results

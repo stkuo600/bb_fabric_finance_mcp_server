@@ -309,6 +309,7 @@ Get column details for a specific table.
 | TABLE_AMBIGUOUS | An unqualified table name in `fabric_describe_table` exists in more than one schema; the message lists the candidate schemas. Re-run with a schema-qualified name. |
 | TOKEN_EXPIRED | Write confirmation token has expired |
 | TOKEN_INVALID | Write confirmation token is missing, malformed, or has an invalid signature |
+| WRITE_STATE_UNKNOWN | Connection dropped mid-write; the statement may or may not have committed. Not auto-retried (would risk duplicate application under autocommit). Verify the table state before retrying. In `fabric_execute_write_batch`, the affected slot carries this code while other statements report their own status. |
 | CONFIG_ERROR | Server misconfiguration |
 
 ### `QUERY_ERROR` details: Fabric-specific remediation hints
