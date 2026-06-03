@@ -131,6 +131,88 @@ class TestFabricDatabase:
         assert e.sqlstate == "42S02"
 
     @patch("src.database.pyodbc.connect")
+    def test_error_message_redacts_server_and_database_identifiers(
+        self, mock_connect: MagicMock
+    ) -> None:
+        """ODBC diagnostics embed the Fabric hostname + database name. The
+        on-wire FabricQueryError.message must not leak them across the trust
+        boundary; benign query-side text is preserved (P9)."""
+        import pyodbc
+
+        from src.database import FabricQueryError
+
+        db, _ = self._make_db()  # server=test.datawarehouse.fabric.microsoft.com, db=gold_warehouse
+        raw = (
+            "[Microsoft][ODBC Driver 18 for SQL Server]Cannot open database "
+            "'gold_warehouse' requested by the login on server "
+            "'test.datawarehouse.fabric.microsoft.com'."
+        )
+        mock_connect.return_value.cursor.return_value.execute.side_effect = pyodbc.Error(
+            "28000", raw
+        )
+
+        with pytest.raises(FabricQueryError) as exc_info:
+            db.execute_query("SELECT 1")
+
+        msg = exc_info.value.message
+        assert "test.datawarehouse.fabric.microsoft.com" not in msg, (
+            f"server hostname must be redacted from the on-wire message; got {msg}"
+        )
+        assert "gold_warehouse" not in msg, "database name must be redacted"
+        # The SQLSTATE is still surfaced for the caller to act on.
+        assert exc_info.value.sqlstate == "28000"
+
+    @patch("src.database.pyodbc.connect")
+    def test_error_message_preserves_query_side_text(
+        self, mock_connect: MagicMock
+    ) -> None:
+        """Redaction must not strip useful query-side diagnostics that help the
+        caller self-correct (these contain no server/db identifiers)."""
+        import pyodbc
+
+        from src.database import FabricQueryError
+
+        db, _ = self._make_db()
+        mock_connect.return_value.cursor.return_value.execute.side_effect = pyodbc.Error(
+            "42S02", "Invalid object name 'foo'"
+        )
+
+        with pytest.raises(FabricQueryError) as exc_info:
+            db.execute_query("SELECT * FROM foo")
+        assert "Invalid object name" in exc_info.value.message
+
+    @patch("src.database.pyodbc.connect")
+    def test_full_error_text_logged_server_side(
+        self, mock_connect: MagicMock, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The raw error (incl. identifiers) must still be available server-side
+        for diagnosis — log server-side, scrub client-side."""
+        import logging
+
+        import pyodbc
+
+        from src.database import FabricQueryError
+
+        db, _ = self._make_db()
+        raw = "Cannot open database 'gold_warehouse' on test.datawarehouse.fabric.microsoft.com."
+        mock_connect.return_value.cursor.return_value.execute.side_effect = pyodbc.Error(
+            "28000", raw
+        )
+
+        with (
+            caplog.at_level(logging.ERROR, logger="fabric_mcp.database"),
+            pytest.raises(FabricQueryError),
+        ):
+            db.execute_query("SELECT 1")
+
+        logged = " ".join(
+            str(getattr(r, "error_detail", "")) for r in caplog.records
+        )
+        assert "gold_warehouse" in logged, (
+            "full raw error must be retained server-side via the error_detail field"
+        )
+
+    @patch("src.database.pyodbc.connect")
     def test_query_error_without_known_fabric_pattern_has_no_hint(self, mock_connect: MagicMock) -> None:
         """For non-matching errors, `details` stays None — no false hints."""
         import pyodbc
