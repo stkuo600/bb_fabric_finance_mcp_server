@@ -36,16 +36,29 @@ def _strip_literals_and_comments(sql: str) -> str:
 
 
 def _is_read_only_query(sql: str) -> bool:
-    """Accept SELECT or `WITH ... SELECT`. Reject if any outer-statement
-    write DML keyword (INSERT/UPDATE/DELETE/MERGE) appears.
+    """Accept a single SELECT or `WITH ... SELECT` statement. Reject anything
+    else.
 
-    CTE bodies are grammatically SELECT-only in T-SQL, so a write keyword
-    surviving the literal/comment strip signals a write at the outer
-    statement (e.g. `WITH cte AS (...) INSERT INTO ...`).
+    Two layers, both evaluated after stripping string/identifier literals and
+    comments so separators/keywords inside them do not count:
+
+    1. Single-statement rule: SQL Server/pyodbc executes every `;`-separated
+       statement in one batch, so a leading SELECT followed by a stacked
+       statement (e.g. `SELECT 1; DROP TABLE ...`, `; EXEC ...`, `; GRANT ...`)
+       would run under the privileged service principal. Reject any content
+       after the first `;`. A single trailing `;` (and semicolons confined to
+       literals/comments) remains allowed.
+    2. Write-DML rule: a write keyword (INSERT/UPDATE/DELETE/MERGE) surviving
+       the strip signals a write at the outer statement, e.g. a CTE-prefixed
+       `WITH cte AS (...) INSERT INTO ...` (CTE bodies are grammatically
+       SELECT-only in T-SQL).
     """
     if not _READ_PREFIX.match(sql):
         return False
     cleaned = _strip_literals_and_comments(sql)
+    _, _, after_first_separator = cleaned.partition(";")
+    if after_first_separator.strip():
+        return False
     return _WRITE_DML.search(cleaned) is None
 
 
@@ -56,8 +69,9 @@ def register_query_tools(mcp: FastMCP, db: FabricDatabase, config: FabricSetting
     def fabric_execute_query(sql: str, max_rows: int | None = None) -> str:
         """Execute a read-only SQL query against the Fabric data warehouse.
 
-        Accepts a SELECT, or a CTE-prefixed `WITH ... SELECT`. Other statement
-        types (and CTE-prefixed write DML) are rejected.
+        Accepts a single SELECT, or a CTE-prefixed `WITH ... SELECT`. Other
+        statement types (and CTE-prefixed write DML) are rejected, as are
+        multi-statement batches (anything after a `;` separator).
 
         Args:
             sql: Read-only SQL to execute.
@@ -73,8 +87,9 @@ def register_query_tools(mcp: FastMCP, db: FabricDatabase, config: FabricSetting
                 raise ToolInputError(
                     code="INVALID_OPERATION",
                     message=(
-                        "Only read-only queries are allowed: a SELECT, or a CTE-prefixed "
-                        "`WITH ... SELECT`. Use fabric_preview_write for INSERT/UPDATE."
+                        "Only a single read-only statement is allowed: a SELECT, or a "
+                        "CTE-prefixed `WITH ... SELECT`. Multi-statement batches (anything "
+                        "after a `;`) are rejected. Use fabric_preview_write for INSERT/UPDATE."
                     ),
                 )
 
