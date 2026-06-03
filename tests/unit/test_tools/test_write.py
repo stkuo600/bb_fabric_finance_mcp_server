@@ -233,6 +233,21 @@ class TestPreviewWriteSingleStatementSemicolonAllowed:
 class TestFabricExecuteWrite:
     """Test the execute write tool."""
 
+    def test_docstring_does_not_claim_fixed_five_minute_expiry(self) -> None:
+        """The tool docstring is the LLM-facing contract for retry/timing. It
+        must not hard-code '5-minute' validity — the real expiry is
+        configurable (default 15) via FABRIC_WRITE_TOKEN_EXPIRY_MINUTES
+        (P11/P13)."""
+        tools = _make_write_tools()
+        fn, _ = tools["fabric_execute_write"]
+        doc = fn.__doc__ or ""
+        assert "5-minute" not in doc and "5 minute" not in doc, (
+            f"docstring must not claim a fixed 5-minute validity; got: {doc!r}"
+        )
+        assert "write_token_expiry_minutes" in doc.lower() or "15" in doc, (
+            "docstring should reference the configurable expiry (default 15)"
+        )
+
     def test_valid_token_executes_write(self) -> None:
         tools = _make_write_tools()
         preview_fn, _ = tools["fabric_preview_write"]
