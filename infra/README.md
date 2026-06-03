@@ -64,6 +64,34 @@ of trusting the build command's exit code. To avoid the crash entirely, run from
 UTF-8 console (`chcp 65001`) or PowerShell with
 `[Console]::OutputEncoding=[Text.Encoding]::UTF8`.
 
+## Cold start & the first write after idle
+
+The app runs with `min-replicas = 0` (see `config.env`), so after a period of no
+traffic it scales to zero and the next request cold-starts a replica. The first
+**write** that lands on a freshly woken replica can fail with
+`WRITE_STATE_UNKNOWN` because the Fabric connection pool is not yet warm and the
+initial connection gets dropped during the statement.
+
+This is **expected, not a bug**: the write path is deliberately *fail-safe* — on a
+connection drop mid-write it does **not** auto-retry (a non-idempotent INSERT/UPDATE
+could otherwise be applied twice), and instead returns `WRITE_STATE_UNKNOWN` so the
+caller can verify state and retry explicitly. The retry then succeeds against the
+now-warm connection. Verified live 2026-06-03: the first `fabric_execute_write` after
+an idle period returned `WRITE_STATE_UNKNOWN`; an immediate re-run returned
+`affected_rows: 0` cleanly.
+
+Operational guidance:
+- **Reads** are unaffected in practice (idempotent — they auto-retry on a dropped
+  connection).
+- **Writes**: if a caller's *first* write after idle returns `WRITE_STATE_UNKNOWN`,
+  it should verify the table state (the statement almost certainly did **not**
+  commit) and simply retry once; the second attempt hits a warm connection.
+- To eliminate cold starts entirely (at the cost of one always-on replica), set
+  `MIN_REPLICAS=1` in `config.env` and redeploy, or:
+  ```bash
+  az containerapp update -n fabric-finance-mcp-server -g mcp_resource_group --min-replicas 1
+  ```
+
 ## First-time / disaster recovery
 
 `infra/deploy.sh` recreates everything (RG, ACR, env, app, secrets, probes) from
