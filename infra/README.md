@@ -33,6 +33,25 @@ bash infra/update.sh 34e5864
 `update.sh` only swaps the image; all env vars / secrets are preserved.
 Verify after: `curl -s https://<app-url>/health` → `{"status":"ok"}`.
 
+## Dependencies & reproducible builds
+
+Runtime dependencies are **pinned with hashes** in `requirements.txt` (the
+lockfile), and the Dockerfile installs them with `pip install --require-hashes`.
+This makes image builds reproducible and prevents silently picking up a new
+(possibly vulnerable or breaking) transitive version on rebuild.
+
+`pyproject.toml` holds the loose `>=` source ranges; `requirements.txt` is the
+resolved lock. After changing dependencies in `pyproject.toml`, regenerate it:
+
+```bash
+uv pip compile pyproject.toml --universal --generate-hashes \
+    --python-version 3.12 --output-file requirements.txt
+# optional: confirm the new pins are CVE-free
+pip install pip-audit && pip-audit -r requirements.txt
+```
+
+Commit the updated `requirements.txt` alongside the `pyproject.toml` change.
+
 ## Environment variables (set on the Container App)
 
 `FABRIC_SERVER`, `FABRIC_DATABASE`, `FABRIC_CLIENT_ID`, `FABRIC_CLIENT_SECRET`,

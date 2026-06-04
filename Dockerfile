@@ -15,9 +15,18 @@ RUN apt-get update && \
 
 WORKDIR /app
 
-COPY pyproject.toml .
+# Install locked, hash-verified dependencies first. This layer is cached and only
+# rebuilds when requirements.txt changes (not on every source edit), and pins the
+# full transitive dependency set for reproducible builds. requirements.txt is the
+# lockfile; regenerate it from pyproject.toml with:
+#   uv pip compile pyproject.toml --universal --generate-hashes \
+#       --python-version 3.12 --output-file requirements.txt
+COPY pyproject.toml requirements.txt ./
+RUN pip install --no-cache-dir --require-hashes -r requirements.txt
+
+# Install the application itself without re-resolving (deps are already locked).
 COPY src/ src/
-RUN pip install --no-cache-dir .
+RUN pip install --no-cache-dir --no-deps .
 
 RUN useradd --create-home appuser
 USER appuser
