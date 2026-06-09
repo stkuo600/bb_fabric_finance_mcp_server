@@ -1251,3 +1251,32 @@ class TestObservability:
         assert len(h1) == 16
         # Hex characters only — readable, paste-able.
         int(h1, 16)  # no exception → valid hex
+
+
+class TestConnectionPoolingDisabled:
+    """Reproduces .claude/bugfix/2026-06-09-pyodbc-pooling-defeats-reconnect.
+
+    The application caches a single connection and recovers from a dead one
+    by `_discard_connection()` (`close()`) + reopening. That recovery only
+    works if ODBC connection pooling is OFF: with pyodbc's default
+    `pooling=True`, `close()` returns the dead connection to the unixODBC
+    pool and the next `pyodbc.connect()` with the identical connection string
+    draws the SAME dead handle back out — so the existing 08S01 reconnect is
+    silently defeated and every query fails until the process restarts.
+
+    pyodbc docs: `pooling` defaults to True and can only be changed before the
+    first connection (it configures the shared HENV). Importing `src.database`
+    must therefore have already turned it off.
+    """
+
+    def test_module_import_disables_odbc_pooling(self) -> None:
+        import pyodbc
+
+        import src.database  # noqa: F401  (import for its import-time side effect)
+
+        assert pyodbc.pooling is False, (
+            "src.database must set pyodbc.pooling = False at import (before any "
+            "connect) so _discard_connection() truly closes the dead connection "
+            "and the 08S01 reconnect actually rebuilds it instead of pulling the "
+            "same dead handle back out of the ODBC pool"
+        )

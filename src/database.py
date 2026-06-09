@@ -17,6 +17,18 @@ import pyodbc
 from src.auth import FabricAuth
 from src.models import ColumnInfo
 
+# This app caches and serialises a single connection itself (see FabricDatabase)
+# and recovers from a dead one via _discard_connection() + reconnect. ODBC
+# connection pooling — pyodbc's default (pooling=True) — breaks that recovery:
+# close() returns the dead connection to the unixODBC pool, and the next
+# connect() with the identical connection string hands the SAME dead handle
+# back, so the 08S01 reconnect reuses the dead connection forever (only a
+# process restart empties the pool). Set at module import — before any
+# FabricDatabase connects — because pyodbc requires `pooling` to be changed
+# before the first connection (it configures the shared HENV; pyodbc docs).
+# See .claude/bugfix/2026-06-09-pyodbc-pooling-defeats-reconnect.
+pyodbc.pooling = False
+
 logger = logging.getLogger("fabric_mcp.database")
 
 _T = TypeVar("_T")
